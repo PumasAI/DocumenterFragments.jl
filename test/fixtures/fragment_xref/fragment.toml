@@ -1,0 +1,11 @@
+name = "Fragment Xref"
+modules = ["FragmentXref"]
+doctest_setup = "using FragmentXref"
+
+[[pages]]
+title = "Overview"
+file = "overview.md"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

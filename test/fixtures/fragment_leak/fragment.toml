@@ -1,0 +1,11 @@
+name = "Fragment Leak"
+modules = ["FragmentA"]
+doctest_setup = "using FragmentA"
+
+[[pages]]
+title = "Overview"
+file = "overview.md"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

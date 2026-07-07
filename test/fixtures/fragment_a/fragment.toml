@@ -1,0 +1,11 @@
+name = "Fragment A"
+modules = ["FragmentA"]
+doctest_setup = "using FragmentA"
+
+[[pages]]
+title = "Introduction"
+file = "introduction.md"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

@@ -42,3 +42,16 @@ jobs:
         with:
           tool: just
       - run: just check-format
+  finalize:
+    name: CI result
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [test, runic]
+    steps:
+      - run: |
+          results='${{ toJSON(needs.*.result) }}'
+          echo "Job results: $results"
+          if echo "$results" | grep -qE '"(failure|cancelled)"'; then
+            echo "Some required jobs failed or were cancelled"
+            exit 1
+          fi

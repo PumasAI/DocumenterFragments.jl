@@ -211,7 +211,7 @@ function build_fragment(
         dir::AbstractString;
         build = joinpath(dir, "build"),
         module_map = Dict{String, Module}(),
-        doctest::Bool = false,
+        doctest::Bool = true,
         warnonly = Symbol[],
         checkdocs::Symbol = :all,
         prettyurls::Bool = true,

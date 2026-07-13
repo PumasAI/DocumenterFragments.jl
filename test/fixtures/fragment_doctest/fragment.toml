@@ -1,0 +1,6 @@
+name = "Fragment Doctest"
+modules = ["FragmentDoctest"]
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

@@ -35,12 +35,26 @@ module FragmentMissing
     function mfun end
 end
 
+module FragmentDoctest
+    export qux
+    """
+        qux()
+
+    ```jldoctest
+    julia> 1 + 1
+    3
+    ```
+    """
+    function qux end
+end
+
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 const MODULE_MAP = Dict(
     "FragmentA" => FragmentA,
     "FragmentB" => FragmentB,
     "FragmentXref" => FragmentXref,
     "FragmentMissing" => FragmentMissing,
+    "FragmentDoctest" => FragmentDoctest,
 )
 
 readbuilt(build, parts...) = read(joinpath(build, parts...), String)
@@ -163,6 +177,26 @@ end
         module_map = MODULE_MAP,
     )
     @test isfile(joinpath(build, "overview", "index.html"))
+end
+
+@testset "doctests run by default and fail on mismatch" begin
+    reset_doctestmeta!()
+    @test_throws "doctest error" silent_build(
+        joinpath(FIXTURES, "fragment_doctest");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "doctest = false skips doctesting" begin
+    reset_doctestmeta!()
+    build = build_fragment(
+        joinpath(FIXTURES, "fragment_doctest");
+        build = mktempdir(),
+        doctest = false,
+        module_map = MODULE_MAP,
+    )
+    @test isfile(joinpath(build, "docstrings", "index.html"))
 end
 
 @testset "integrate_fragments into a main site" begin

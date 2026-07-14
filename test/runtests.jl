@@ -286,3 +286,66 @@ end
         module_map = MODULE_MAP,
     )
 end
+
+@testset "two fragments merge under a shared mount" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n")
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (; dir = joinpath(FIXTURES, "merge_alpha"), mount = "combined"),
+            (; dir = joinpath(FIXTURES, "merge_beta"), mount = "combined"),
+        ];
+        module_map = MODULE_MAP,
+    )
+
+    @test [f.name for f in c.fragments] == ["Merge Alpha", "Merge Beta"]
+    @test [f.pages.second[1].second for f in c.fragments] ==
+        ["combined/alpha.md", "combined/beta.md"]
+    @test c.namespacing.page_slugs ==
+        ["combined/alpha.md" => "combined", "combined/beta.md" => "combined_2"]
+    @test c.modules == Module[FragmentA, FragmentB]
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = [c.namespacing],
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    @test isfile(joinpath(build, "combined", "alpha", "index.html"))
+    @test isfile(joinpath(build, "combined", "beta", "index.html"))
+
+    alpha = readbuilt(build, "combined", "alpha", "index.html")
+    beta = readbuilt(build, "combined", "beta", "index.html")
+    @test occursin("combined-Examples", alpha)
+    @test occursin("combined_2-Examples", beta)
+    @test occursin("foo", alpha)
+    @test occursin("bar", beta)
+end
+
+@testset "colliding filenames under a shared mount error clearly" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    cp(joinpath(FIXTURES, "main_site", "src"), main_src)
+
+    @test_throws "colliding file paths" integrate_fragments(
+        main_src,
+        [
+            (; dir = joinpath(FIXTURES, "fragment_a"), mount = "shared"),
+            (; dir = joinpath(FIXTURES, "fragment_b"), mount = "shared"),
+        ];
+        module_map = MODULE_MAP,
+    )
+end

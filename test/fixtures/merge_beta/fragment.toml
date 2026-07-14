@@ -1,0 +1,6 @@
+name = "Merge Beta"
+modules = ["FragmentB"]
+
+[[pages]]
+title = "Beta"
+file = "beta.md"

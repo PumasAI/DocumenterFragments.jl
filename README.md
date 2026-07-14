@@ -54,8 +54,9 @@ standalone build, and the main site build reads the same file to assemble its
 navigation, union the module lists, and replay each fragment's doctest setup.
 
 Placement in the larger site is deliberately absent: the mount path (e.g.
-`/widgets/`) and anchor namespace prefix must be unique across all fragments, so
-the main site assigns both at composition time.
+`/widgets/`) and anchor namespace prefix are assigned by the main site at
+composition time. Each fragment normally gets its own mount, but several can share
+one (see "Sharing a mount").
 
 ## Docstring coverage
 
@@ -120,8 +121,37 @@ shares one theme, one search index and one navigation tree.
 The `namespacing` plugin must be passed in `plugins`; without it fragment pages
 build un-namespaced and collide (see "Anchor namespacing").
 
-Each fragment's namespace prefix defaults to its `mount` identifier, overridable
-with a `slug` field on the spec (useful when the mount is a nested path).
+`integrate_fragments` assigns each fragment a unique anchor namespace derived from
+its `mount`, so the caller only chooses mounts. The namespace never appears in a
+URL or in anything an author writes (`@ref` links are rewritten automatically), so
+it is not a spec option.
+
+### Sharing a mount
+
+Several fragments can share one mount to produce flat, intermixed URLs (e.g.
+`Widgets` and `WidgetsPlots` both under `/widgets/`, giving `/widgets/introduction`
+and `/widgets/plots` side by side):
+
+```julia
+c = integrate_fragments(main_src, [
+    (; dir = "…/Widgets.jl/docs", mount = "widgets"),
+    (; dir = "…/WidgetsPlots.jl/docs", mount = "widgets"),
+])
+```
+
+Each fragment's sources are merged into the shared `main_src/<mount>/`, and its
+module scope and anchor namespace are applied to its own pages only. So docstring
+references resolve against the fragment that authored them, and each fragment keeps
+its own namespace even though the pages sit side by side: a `## Examples` heading in
+one does not collide with a `## Examples` in the other. The integrator makes the
+per-fragment namespaces unique automatically (fragments sharing a mount cannot each
+derive a unique namespace from it), so this needs no coordination.
+
+The one real constraint is that file paths must not collide: the fragments' page
+and asset paths (relative to each `src/`) are merged into one directory, so two
+fragments both shipping `docstrings.md` is an error. `integrate_fragments` reports
+the offending path and the fragment that introduced it; rename the file in one of
+them.
 
 ### Rerouting pages
 
@@ -202,14 +232,15 @@ single fragment's CI catches exactly the same content errors either way:
 - a namespace collision between two fragments is invisible to any single fragment
   by definition, so it is checked only at composition.
 
-So the split is: the fragment CI validates content; the main site validates
-placement (unique mounts and namespaces, cross-fragment policy). In v1 this is
-intentional: fragments stay decoupled and do not coordinate anchor names.
+So the split is: the fragment CI validates content; the main site assigns
+placement (mounts, and a unique namespace per fragment) and validates
+cross-fragment policy. In v1 this is intentional: fragments stay decoupled and do
+not coordinate anchor names.
 
 Future extension (not implemented): cross-fragment links via DocumenterInterLinks.
 Documenter writes an `objects.inv` inventory per build, and DocumenterInterLinks
 can load another fragment's inventory (including from a committed local `.toml`)
-and resolve `[text](@extref widgets-...)` links against it. The slug-based
+and resolve `[text](@extref widgets-...)` links against it. The per-fragment
 namespacing already makes every anchor globally unique, so this can be added
 without redesign.
 

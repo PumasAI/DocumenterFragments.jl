@@ -1,0 +1,6 @@
+name = "Merge Alpha"
+modules = ["FragmentA"]
+
+[[pages]]
+title = "Alpha"
+file = "alpha.md"

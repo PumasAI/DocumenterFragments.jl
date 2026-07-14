@@ -112,14 +112,16 @@ function namespace_ast!(node, prefix)
 end
 
 struct FragmentNamespaces <: Documenter.Plugin
-    prefixes::Vector{Pair{String, String}}
+    page_slugs::Vector{Pair{String, String}}
 end
 FragmentNamespaces() = FragmentNamespaces(Pair{String, String}[])
 
-function namespace_for(path, prefixes)
-    p = replace(String(path), '\\' => '/')
-    for (mount, ns) in prefixes
-        (p == mount || startswith(p, mount * "/")) && return ns
+strip_ext(path) = splitext(replace(String(path), '\\' => '/'))[1]
+
+function namespace_for(path, page_slugs)
+    key = strip_ext(path)
+    for (page, ns) in page_slugs
+        strip_ext(page) == key && return ns
     end
     return nothing
 end
@@ -128,11 +130,10 @@ abstract type FragmentNamespacing <: Documenter.Builder.DocumentPipeline end
 Documenter.Selectors.order(::Type{FragmentNamespacing}) = 1.5
 function Documenter.Selectors.runner(::Type{FragmentNamespacing}, doc)
     haskey(doc.plugins, FragmentNamespaces) || return
-    prefixes = Documenter.getplugin(doc, FragmentNamespaces).prefixes
-    isempty(prefixes) && return
-    ordered = sort(prefixes; by = p -> length(first(p)), rev = true)
+    page_slugs = Documenter.getplugin(doc, FragmentNamespaces).page_slugs
+    isempty(page_slugs) && return
     for (path, page) in doc.blueprint.pages
-        ns = namespace_for(path, ordered)
+        ns = namespace_for(path, page_slugs)
         ns === nothing && continue
         for child in collect(page.mdast.children)
             namespace_ast!(child, ns)
@@ -163,17 +164,22 @@ function make_scope(mods, key)
     return name
 end
 
-function set_currentmodule!(srcdir, scopename; page_meta = ())
+function meta_block(scopename; page_meta = ())
     lines = ["CurrentModule = $(scopename)"]
     for (k, v) in page_meta
         push!(lines, "$k = $v")
     end
-    block = "```@meta\n" * join(lines, "\n") * "\n```\n\n"
+    return "```@meta\n" * join(lines, "\n") * "\n```\n\n"
+end
+
+prepend_block!(path, block) = write(path, block * read(path, String))
+
+function set_currentmodule!(srcdir, scopename; page_meta = ())
+    block = meta_block(scopename; page_meta)
     for (root, _, files) in walkdir(srcdir)
         for f in files
             endswith(f, ".md") || continue
-            p = joinpath(root, f)
-            write(p, block * read(p, String))
+            prepend_block!(joinpath(root, f), block)
         end
     end
     return
@@ -264,6 +270,26 @@ end
 
 default_namespace(mount) = slugify(replace(String(mount), '/' => '-'))
 
+function merge_fragment_src!(src, dest, mount, fragname)
+    copied = String[]
+    for (root, _, files) in walkdir(src)
+        for f in files
+            rel = normpath(joinpath(relpath(root, src), f))
+            target = joinpath(dest, rel)
+            isfile(target) && error(
+                "Fragment \"$fragname\" mounted at \"$mount\" contributes file \"$rel\", " *
+                    "but that path already exists under the mount (from another fragment " *
+                    "sharing this mount, or the main site). Fragments sharing a mount must " *
+                    "not have colliding file paths; rename the file in one of them.",
+            )
+            mkpath(dirname(target))
+            cp(joinpath(root, f), target)
+            push!(copied, rel)
+        end
+    end
+    return copied
+end
+
 function prepare_fragment!(
         main_src::AbstractString,
         dir::AbstractString,
@@ -278,11 +304,17 @@ function prepare_fragment!(
     scopename = make_scope(mods, slug)
 
     dest = joinpath(main_src, mount)
-    cp(joinpath(dir, "src"), dest)
-    set_currentmodule!(dest, scopename; page_meta)
+    copied = merge_fragment_src!(joinpath(dir, "src"), dest, mount, meta.name)
+
+    block = meta_block(scopename; page_meta)
+    for rel in copied
+        endswith(rel, ".md") || continue
+        prepend_block!(joinpath(dest, rel), block)
+    end
 
     return (
         pages = meta.name => documenter_pages(meta; prefix = mount),
+        page_paths = [replace(joinpath(mount, rel), '\\' => '/') for rel in copied if endswith(rel, ".md")],
         modules = mods,
         meta = meta,
     )
@@ -333,16 +365,28 @@ struct Integration
     namespacing::FragmentNamespaces
 end
 
+function disambiguate!(taken, base)
+    key = base
+    n = 1
+    while key in taken
+        n += 1
+        key = "$(base)_$n"
+    end
+    push!(taken, key)
+    return key
+end
+
 """
     integrate_fragments(main_src, specs; module_map = Dict{String,Module}()) -> Integration
 
 Integrate several fragments into a main site's source tree rooted at `main_src`.
 
 Each spec names a fragment `dir` and the `mount` path to place it under (plus
-optional `slug`, `page_meta`, and `detach`). For every fragment the sources are
-copied under its mount, its module scope and doctest setup are established, and
-any pages listed in `detach` are pulled out for the integrator to reroute. Each
-module must be owned by exactly one fragment.
+optional `page_meta` and `detach`). For every fragment the sources are copied
+under its mount, its module scope and doctest setup are established, a unique
+anchor namespace is assigned, and any pages listed in `detach` are pulled out for
+the integrator to reroute. Each module must be owned by exactly one fragment.
+Several fragments may share a mount, provided their file paths do not collide.
 
 Returns an [`Integration`](@ref) whose `fragments` are [`IntegratedFragment`](@ref)s
 (each carrying `pages`, `detached`, `modules`, ...), the combined `modules`, and a
@@ -351,12 +395,15 @@ unique across fragments.
 """
 function integrate_fragments(main_src::AbstractString, specs; module_map = Dict{String, Module}())
     validate_module_ownership(specs)
-    prefixes = Pair{String, String}[]
+    page_slugs = Pair{String, String}[]
+    slugs_taken = Set{String}()
     fragments = map(specs) do spec
-        slug = hasproperty(spec, :slug) ? spec.slug : default_namespace(spec.mount)
+        slug = disambiguate!(slugs_taken, default_namespace(spec.mount))
         page_meta = hasproperty(spec, :page_meta) ? spec.page_meta : ()
         prep = prepare_fragment!(main_src, spec.dir, spec.mount; slug, module_map, page_meta)
-        push!(prefixes, spec.mount => slug)
+        for path in prep.page_paths
+            push!(page_slugs, path => slug)
+        end
 
         detach = hasproperty(spec, :detach) ?
             Set(joinpath(spec.mount, f) for f in spec.detach) : Set{String}()
@@ -375,7 +422,7 @@ function integrate_fragments(main_src::AbstractString, specs; module_map = Dict{
         )
     end
     modules = unique(reduce(vcat, (f.modules for f in fragments); init = Module[]))
-    return Integration(fragments, modules, FragmentNamespaces(prefixes))
+    return Integration(fragments, modules, FragmentNamespaces(page_slugs))
 end
 
 end

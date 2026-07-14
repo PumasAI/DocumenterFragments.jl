@@ -1,7 +1,7 @@
 name = "DocumenterFragments"
 uuid = "862d714e-9826-4bb1-afc7-f2d363bba08c"
 authors = ["PumasAI"]
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"

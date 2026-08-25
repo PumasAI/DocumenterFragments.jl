@@ -15,6 +15,7 @@ MyPackage/
   docs/
     fragment.toml      declarative metadata (see below)
     make.jl            one-liner calling build_fragment
+    references.bib     optional bibliography (see "Fragment bibliographies")
     src/
       introduction.md
       docstrings.md     an @autodocs page over the package's modules
@@ -37,6 +38,7 @@ There is no `using MyPackage`; `build_fragment` loads the modules named in
 name = "Widgets"                          # section title in the main site and standalone sitename
 modules = ["Widgets", "WidgetsCore"]      # drives @autodocs coverage / checkdocs
 doctest_setup = "using Widgets, TestData" # applied via DocMeta.setdocmeta!
+bibliography = "references.bib"           # optional, relative to docs/
 
 [[pages]]
 title = "Introduction"
@@ -105,7 +107,7 @@ makedocs(;
     modules = c.modules,                                   # union of all fragments' modules
     pages = Any["Home"=>"index.md"; [f.pages for f in c.fragments]],
     source = main_src,
-    plugins = [c.namespacing],                             # applies anchor namespacing
+    plugins = c.plugins,                                   # namespacing, and citations if any
     # ...usual HTML options...
 )
 ```
@@ -113,13 +115,15 @@ makedocs(;
 `integrate_fragments` copies each fragment's sources (pages and assets together) into
 `main_src/<mount>/`, runs `DocMeta.setdocmeta!` for each fragment's modules, and
 returns the unioned module list, a `fragments` vector carrying each fragment's
-mount-prefixed page tree, and a `namespacing` plugin. The pages are returned per
+mount-prefixed page tree, and the `plugins` to pass to `makedocs`. The pages are returned per
 fragment rather than pre-merged so the main site controls where each section sits
 in its navigation. The main site then runs a single `makedocs`, so the whole site
 shares one theme, one search index and one navigation tree.
 
-The `namespacing` plugin must be passed in `plugins`; without it fragment pages
-build un-namespaced and collide (see "Anchor namespacing").
+The returned `plugins` must be passed to `makedocs`; without them fragment pages
+build un-namespaced and collide (see "Anchor namespacing"). It always contains
+the `namespacing` plugin and, if any fragment has a bibliography, the merged
+`CitationBibliography` (see "Fragment bibliographies").
 
 `integrate_fragments` assigns each fragment a unique anchor namespace derived from
 its `mount`, so the caller only chooses mounts. The namespace never appears in a
@@ -244,6 +248,121 @@ and resolve `[text](@extref widgets-...)` links against it. The per-fragment
 namespacing already makes every anchor globally unique, so this can be added
 without redesign.
 
+## Fragment bibliographies
+
+A fragment can own a bibliography. It names a BibTeX file in `fragment.toml`
+(`bibliography = "references.bib"`, resolved relative to the fragment's `docs/`),
+and its pages then use `@cite` links and `@bibliography` blocks as in any
+DocumenterCitations site. `build_fragment` constructs the `CitationBibliography`
+plugin itself, so `make.jl` stays a one-liner, save for loading the package that
+provides the plugin type:
+
+```julia
+using DocumenterFragments: build_fragment
+import DocumenterCitations
+build_fragment(@__DIR__)
+```
+
+DocumenterCitations is a weak dependency: it has to be loaded by the `make.jl`
+of the fragment and of any main site composing it, but a fragment that does not
+cite anything neither loads it nor pays for it. To choose a style or otherwise
+configure the plugin, pass your own in `plugins`; `build_fragment` then leaves it
+alone.
+
+Documenter keys plugins by type, so a composed site holds exactly one
+`CitationBibliography` and a fragment cannot carry its own into it. Instead
+`integrate_fragments` reads every fragment's bibliography and merges the entries
+into a single plugin, returned in `plugins`. A main site with a bibliography of
+its own passes it in and it is merged too, along with its style:
+
+```julia
+c = integrate_fragments(main_src, specs;
+    citations = CitationBibliography(joinpath(@__DIR__, "references.bib")),
+)
+```
+
+Citation keys are not namespaced, unlike heading anchors. Two fragments writing
+`## Examples` is entirely likely; two fragments picking the same BibTeX key for
+different works is not, since the usual key is author plus year plus a title
+word. What does happen is the same entry being copied into two fragments from a
+common source, and then sharing a key is right: the merged bibliography carries
+the work once and both fragments cite it.
+
+So a shared key is allowed, but the entries have to match exactly. If they differ
+in any field the merge errors, naming the key, both contributors and the values
+that differ, since nothing downstream would notice one fragment silently citing
+the other's copy of a work whose title, year or authors have drifted:
+
+```
+Citation key "Knuth1984" is supplied by both fragment "Widgets" and fragment "Gadgets", but the entries differ:
+  date.year
+    fragment "Widgets": "1984"
+    fragment "Gadgets": "1986"
+  title
+    fragment "Widgets": "The TeXbook"
+    fragment "Gadgets": "The TeX book"
+A key shared between fragments, or with the main site, must carry the same entry everywhere; reconcile the `.bib` files, or rename the key in one of them.
+```
+
+That leaves the coordination between fragment and main site owners at: keep
+shared entries identical, which for BibTeX is mostly a one-off, and rename a key
+if two works genuinely collide. In exchange a work cited by several fragments is
+listed once rather than once per fragment.
+
+A fragment citing a key it does not supply itself is caught by its own build
+rather than by the composed site: with only its own bibliography loaded,
+DocumenterCitations fails the fragment's build with `Key ... not found in
+entries`. So a fragment cannot come to depend on another's entries as long as it
+is composed from a version its own CI passed.
+
+### Who owns the canonical bibliography
+
+A `@bibliography` block is *canonical* (the DocumenterCitations default) when it
+defines the link anchors its entries are cited by. A key can only be anchored
+once, so a canonical block silently skips any entry another canonical block
+already claimed. A fragment therefore cannot own one: composed, it would take
+those entries from the site's own bibliography, and citations would lead to
+whichever page happened to be expanded first.
+
+So a fragment's `@bibliography` blocks must all say `Canonical = false`, which
+the fragment's own build enforces, and the composed site holds the canonical
+bibliography: it needs one unscoped `@bibliography` block on a main-site page.
+Every fragment's citations then lead to that one central page, and a fragment's
+own block is a plain re-listing of some works, which is what a "further reading"
+section wants anyway:
+
+````markdown
+## Further reading
+
+General texts on widget design include:
+
+```@bibliography
+Pages = []
+Canonical = false
+
+Knuth1984
+Lamport1994
+```
+````
+
+Composition errors if fragment pages carry citations and no canonical block is
+found outside the fragments. It can only check that such a block exists, not that
+it covers everything, so leave the main site's block unscoped.
+
+A fragment still has to resolve its citations in its own build, where there is no
+main site to hold the anchors. So a fragment that declares a `bibliography` gets
+a generated `References` page carrying its whole bibliography, marked as being
+for the standalone build only, in the same way it gets a generated `index.md`.
+Nothing about the fragment's sources changes between building it alone and
+composing it.
+
+Two rewrites keep a block's meaning the same in both builds:
+
+- `*` means "every entry of my bibliography", which after merging would reach
+  across fragments, so it is replaced by the keys of the fragment's own file.
+- A block with no `Pages` field means "everything cited in this site", which
+  composed likewise spans fragments, so it is scoped to the fragment's own pages.
+
 ## Warnings
 
 Builds are configured to be quiet and strict, so a warning in CI is a real signal
@@ -253,6 +372,12 @@ coverage"), sets `repolink = nothing` to drop the navbar repo-link warning under
 `remotes = nothing`, and synthesizes a minimal `index.md` landing page for the
 standalone build when a fragment has none. Run CI with `--depwarn=error` to also
 make deprecations fatal.
+
+A fragment whose only use of its bibliography is a `@bibliography` block with
+explicitly listed keys, and no `@cite` anywhere, triggers DocumenterCitations'
+"There were no citations" warning: the `Pages`-filtering branch suppresses that
+warning when explicit keys are given, the no-citations branch does not. That is
+an upstream gap and is not worked around here.
 
 `DocMeta.setdocmeta!` is left to warn on overwrite (it warns on any re-set, not
 just a changed value). The warning is kept on because its meaningful case is two

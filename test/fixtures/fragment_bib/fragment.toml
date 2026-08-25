@@ -1,0 +1,11 @@
+name = "Fragment Bib"
+modules = ["FragmentCite"]
+bibliography = "references.bib"
+
+[[pages]]
+title = "Overview"
+file = "overview.md"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

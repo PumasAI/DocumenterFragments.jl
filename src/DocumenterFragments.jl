@@ -13,6 +13,7 @@ struct FragmentMeta
     name::String
     modules::Vector{String}
     doctest_setup::Union{Nothing, String}
+    bibliography::Union{Nothing, String}
     page_entries::Vector{Any}
     dir::String
 end
@@ -22,8 +23,10 @@ function read_fragment(dir::AbstractString)
     name = toml["name"]
     modules = collect(String, get(toml, "modules", String[]))
     setup = get(toml, "doctest_setup", nothing)
+    bib = get(toml, "bibliography", nothing)
+    bibfile = bib === nothing ? nothing : joinpath(dir, bib)
     entries = collect(Any, get(toml, "pages", Any[]))
-    return FragmentMeta(name, modules, setup, entries, String(dir))
+    return FragmentMeta(name, modules, setup, bibfile, entries, String(dir))
 end
 
 function slugify(s)
@@ -111,10 +114,72 @@ function namespace_ast!(node, prefix)
     return
 end
 
+# The same gate DocumenterCitations' `CollectCitations` uses to recognize a
+# citation link.
+is_citation(el) =
+    el isa MarkdownAST.Link && startswith(lowercase(el.destination), "@cite")
+
+# A `@bibliography` block body mixes `Field = value` settings with explicit
+# citation keys. Both are classified with the parser DocumenterCitations itself
+# uses, so that a multi-line field value is not mistaken for a list of keys. Two
+# things change for a composed site, neither of which the fragment can decide for
+# itself: `*` means "every entry of my bibliography", which after merging would
+# reach across fragments, and an unscoped block means "everything cited in this
+# site", which likewise now spans fragments, so it is scoped to the fragment's
+# own pages.
+function scope_bibliography_block!(node, ctx)
+    fields = String[]
+    entries = String[]
+    scoped = false
+    for (ex, str) in Documenter.parseblock(node.element.code, nothing, nothing; raise = false)
+        entry = String(strip(str))
+        if Documenter.isassign(ex)
+            ex.args[1] === :Pages && (scoped = true)
+            push!(fields, entry)
+        elseif entry == "*"
+            append!(entries, ctx.bib_keys)
+        else
+            push!(entries, entry)
+        end
+    end
+    scoped || push!(fields, "Pages = [$(join(map(repr, ctx.pages), ", "))]")
+    return node.element.code = join([fields; entries], '\n') * '\n'
+end
+
+is_bibliography_block(el) =
+    el isa MarkdownAST.CodeBlock && occursin(r"^@bibliography", el.info)
+
+function has_canonical_block(node)
+    is_bibliography_block(node.element) && return is_canonical(node.element.code)
+    return any(has_canonical_block, node.children)
+end
+
+function prepare_citations!(node, ctx)
+    el = node.element
+    if is_citation(el)
+        ctx.citations[] += 1
+        return
+    elseif is_bibliography_block(el)
+        scope_bibliography_block!(node, ctx)
+        return
+    elseif el isa Documenter.DocsNode
+        # Docstring ASTs hang off the element, not off the page tree.
+        for mdast in el.mdasts
+            prepare_citations!(mdast, ctx)
+        end
+    end
+    for c in node.children
+        prepare_citations!(c, ctx)
+    end
+    return
+end
+
 struct FragmentNamespaces <: Documenter.Plugin
     page_slugs::Vector{Pair{String, String}}
+    bibliography_keys::Dict{String, Vector{String}}
 end
-FragmentNamespaces() = FragmentNamespaces(Pair{String, String}[])
+FragmentNamespaces(page_slugs = Pair{String, String}[]) =
+    FragmentNamespaces(page_slugs, Dict{String, Vector{String}}())
 
 strip_ext(path) = splitext(replace(String(path), '\\' => '/'))[1]
 
@@ -140,6 +205,48 @@ function Documenter.Selectors.runner(::Type{FragmentNamespacing}, doc)
         end
     end
     return
+end
+
+# Runs after ExpandTemplates (2.0), so that citations spliced in from docstrings
+# are seen too, and before DocumenterCitations' CollectCitations (2.11).
+abstract type FragmentCitations <: Documenter.Builder.DocumentPipeline end
+Documenter.Selectors.order(::Type{FragmentCitations}) = 2.05
+function Documenter.Selectors.runner(::Type{FragmentCitations}, doc)
+    haskey(doc.plugins, FragmentNamespaces) || return
+    namespaces = Documenter.getplugin(doc, FragmentNamespaces)
+    isempty(namespaces.page_slugs) && return
+    citations = Ref(0)
+    main_canonical = false
+    for (path, page) in doc.blueprint.pages
+        ns = namespace_for(path, namespaces.page_slugs)
+        if ns === nothing
+            main_canonical |= has_canonical_block(page.mdast)
+            continue
+        end
+        ctx = (;
+            bib_keys = get(namespaces.bibliography_keys, ns, String[]),
+            pages = sibling_pages(path, ns, namespaces.page_slugs),
+            citations,
+        )
+        for child in collect(page.mdast.children)
+            prepare_citations!(child, ctx)
+        end
+    end
+    citations[] > 0 && !main_canonical && error(
+        "Fragment pages carry citations, but no canonical `@bibliography` block was found " *
+            "outside the fragments. A fragment's own blocks may not be canonical, so the " *
+            "main site must hold the bibliography: add an unscoped ```@bibliography``` " *
+            "block to one of its pages.",
+    )
+    return
+end
+
+# The fragment's own pages, relative to the page holding the block, which is how
+# a `@bibliography` block's `Pages` are resolved.
+function sibling_pages(path, ns, page_slugs)
+    here = dirname(replace(String(path), '\\' => '/'))
+    isempty(here) && (here = ".")
+    return [relpath(page, here) for (page, slug) in page_slugs if slug == ns]
 end
 
 function load_module(name, module_map)
@@ -174,13 +281,20 @@ end
 
 prepend_block!(path, block) = write(path, block * read(path, String))
 
-function set_currentmodule!(srcdir, scopename; page_meta = ())
-    block = meta_block(scopename; page_meta)
+function markdown_files(srcdir)
+    found = String[]
     for (root, _, files) in walkdir(srcdir)
         for f in files
-            endswith(f, ".md") || continue
-            prepend_block!(joinpath(root, f), block)
+            endswith(f, ".md") && push!(found, joinpath(root, f))
         end
+    end
+    return found
+end
+
+function set_currentmodule!(srcdir, scopename; page_meta = ())
+    block = meta_block(scopename; page_meta)
+    for path in markdown_files(srcdir)
+        prepend_block!(path, block)
     end
     return
 end
@@ -200,6 +314,84 @@ function package_version(dir)
     return get(TOML.parsefile(project), "version", "")
 end
 
+# Bibliographies are handled in the DocumenterCitations extension, so that a
+# fragment that does not cite anything neither loads that package nor triggers
+# its "No `bibfile`" warning. These fallbacks take varargs, so the extension's
+# methods are the more specific ones and win wherever it is loaded.
+citations_unavailable() = error(
+    "A fragment declares a `bibliography` in its `fragment.toml`, which requires " *
+        "DocumenterCitations. Add `import DocumenterCitations` to `make.jl`.",
+)
+
+with_bibliography(::Vararg{Any}) = citations_unavailable()
+read_entries(::Vararg{Any}) = citations_unavailable()
+merge_citations(::Vararg{Any}) = citations_unavailable()
+
+function fragment_plugins(meta::FragmentMeta, plugins)
+    meta.bibliography === nothing && return plugins
+    return with_bibliography(plugins, meta.bibliography)
+end
+
+# Obscure enough that a fragment can still have a page of its own called
+# "references.md"; it only ever exists in the standalone build.
+const REFERENCES_PAGE = "documenterfragments_references.md"
+const BIBLIOGRAPHY_FENCE = r"^`{3,}@bibliography[^\n]*\n(.*?)^`{3,}"ms
+
+function is_canonical(body)
+    for (ex, _) in Documenter.parseblock(body, nothing, nothing; raise = false)
+        Documenter.isassign(ex) && ex.args[1] === :Canonical &&
+            return Core.eval(Main, ex.args[2]) == true
+    end
+    return true
+end
+
+bibliography_bodies(md) = (m[1] for m in eachmatch(BIBLIOGRAPHY_FENCE, md))
+
+# A canonical block defines the anchors its entries are cited by, and a key can
+# only be anchored once, so a fragment claiming them would take them from the
+# composed site's own bibliography. Placement decides who is canonical, and the
+# main site always wins, which the fragment's own build can already tell it.
+function validate_bibliography_blocks(meta::FragmentMeta)
+    for path in markdown_files(joinpath(meta.dir, "src"))
+        any(is_canonical, bibliography_bodies(read(path, String))) && error(
+            "Fragment \"$(meta.name)\" has a canonical `@bibliography` block in " *
+                "\"$(relpath(path, meta.dir))\". A fragment cannot own the canonical " *
+                "bibliography of the site it is composed into, which holds the anchors its " *
+                "citations link to; add `Canonical = false` to the block. The standalone " *
+                "build gets a generated \"$REFERENCES_PAGE\" page to resolve its citations.",
+        )
+    end
+    return
+end
+
+references_placeholder() = """
+# References
+
+This references page was generated by [DocumenterFragments.jl](https://github.com/PumasAI/DocumenterFragments.jl)
+for the standalone fragment build only, so that the fragment's citations resolve
+and are checked here. Once the fragment is integrated it is not present, and the
+full site is expected to carry the canonical bibliography itself.
+
+```@bibliography
+Pages = []
+*
+```
+"""
+
+# The fragment's citations need a canonical bibliography to point at, and the
+# fragment is not allowed to be it, so its own build gets this stand-in, the same
+# way it gets a home page.
+function add_references_page!(pages, srcdir, name)
+    path = joinpath(srcdir, REFERENCES_PAGE)
+    isfile(path) && error(
+        "Fragment \"$name\" declares a bibliography, so the standalone build needs to " *
+            "generate \"$REFERENCES_PAGE\", but the fragment already ships that page. " *
+            "Rename it.",
+    )
+    write(path, references_placeholder())
+    return push!(pages, "References" => REFERENCES_PAGE)
+end
+
 """
     build_fragment(dir; kwargs...) -> build_dir
 
@@ -208,10 +400,16 @@ return the output directory.
 
 The fragment's `fragment.toml` supplies its name, the modules to document
 (loaded automatically, so `make.jl` needs no `using`), an optional
-`doctest_setup`, and the page tree. Keyword arguments mirror the relevant
-`Documenter.makedocs`/`Documenter.HTML` options (`doctest`, `warnonly`,
-`checkdocs`, `prettyurls`, `repolink`, `page_meta`, ...); any extra keywords are
-forwarded to `makedocs`.
+`doctest_setup`, an optional `bibliography` file, and the page tree. Keyword
+arguments mirror the relevant `Documenter.makedocs`/`Documenter.HTML` options
+(`doctest`, `warnonly`, `checkdocs`, `prettyurls`, `plugins`, `page_meta`, ...);
+any extra keywords are forwarded to `makedocs`.
+
+A declared `bibliography` is turned into a `CitationBibliography` plugin unless
+`plugins` already carries one. A generated `References` page is appended so that
+the fragment's citations resolve in the standalone build; any `@bibliography`
+blocks the fragment carries itself must be `Canonical = false`, since the
+composed site owns the canonical bibliography.
 """
 function build_fragment(
         dir::AbstractString;
@@ -224,9 +422,11 @@ function build_fragment(
         repolink = nothing,
         inventory_version = package_version(dir),
         page_meta = (),
+        plugins = Documenter.Plugin[],
         kwargs...,
     )
     meta = read_fragment(dir)
+    meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
     apply_doctestsetup!(meta, mods)
     scopename = make_scope(mods, meta.name)
@@ -247,6 +447,7 @@ function build_fragment(
         write(joinpath(staged_src, "index.md"), placeholder)
         pushfirst!(pages, "Home" => "index.md")
     end
+    meta.bibliography === nothing || add_references_page!(pages, staged_src, meta.name)
     set_currentmodule!(staged_src, scopename; page_meta)
 
     # invokelatest: make_scope bound the scope module into Main during this call, so
@@ -261,6 +462,7 @@ function build_fragment(
         doctest,
         warnonly,
         checkdocs,
+        plugins = fragment_plugins(meta, plugins),
         remotes = nothing,
         format = Documenter.HTML(; prettyurls, edit_link = nothing, repolink, inventory_version),
         kwargs...,
@@ -299,6 +501,7 @@ function prepare_fragment!(
         page_meta = (),
     )
     meta = read_fragment(dir)
+    meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
     apply_doctestsetup!(meta, mods)
     scopename = make_scope(mods, slug)
@@ -363,6 +566,14 @@ struct Integration
     fragments::Vector{IntegratedFragment}
     modules::Vector{Module}
     namespacing::FragmentNamespaces
+    citations::Union{Nothing, Documenter.Plugin}
+    plugins::Vector{Documenter.Plugin}
+end
+
+function Integration(fragments, modules, namespacing, citations)
+    plugins = Documenter.Plugin[namespacing]
+    citations === nothing || push!(plugins, citations)
+    return Integration(fragments, modules, namespacing, citations, plugins)
 end
 
 function disambiguate!(taken, base)
@@ -388,14 +599,27 @@ anchor namespace is assigned, and any pages listed in `detach` are pulled out fo
 the integrator to reroute. Each module must be owned by exactly one fragment.
 Several fragments may share a mount, provided their file paths do not collide.
 
+Fragments declaring a `bibliography` have their entries merged into one
+`CitationBibliography`, keeping their citation keys as written. A key supplied by
+more than one fragment must carry the same entry everywhere, or the merge errors.
+Pass an existing plugin as `citations` to contribute the main site's own
+bibliography and its style.
+
 Returns an [`Integration`](@ref) whose `fragments` are [`IntegratedFragment`](@ref)s
-(each carrying `pages`, `detached`, `modules`, ...), the combined `modules`, and a
-`namespacing` plugin to pass to `makedocs` so anchors and cross-references stay
+(each carrying `pages`, `detached`, `modules`, ...), the combined `modules`, and the
+`plugins` to pass to `makedocs` so anchors, cross-references and citations stay
 unique across fragments.
 """
-function integrate_fragments(main_src::AbstractString, specs; module_map = Dict{String, Module}())
+function integrate_fragments(
+        main_src::AbstractString,
+        specs;
+        module_map = Dict{String, Module}(),
+        citations = nothing,
+    )
     validate_module_ownership(specs)
     page_slugs = Pair{String, String}[]
+    bibliography_keys = Dict{String, Vector{String}}()
+    contributions = Tuple{String, Any}[]
     slugs_taken = Set{String}()
     fragments = map(specs) do spec
         slug = disambiguate!(slugs_taken, default_namespace(spec.mount))
@@ -403,6 +627,11 @@ function integrate_fragments(main_src::AbstractString, specs; module_map = Dict{
         prep = prepare_fragment!(main_src, spec.dir, spec.mount; slug, module_map, page_meta)
         for path in prep.page_paths
             push!(page_slugs, path => slug)
+        end
+        if prep.meta.bibliography !== nothing
+            entries = read_entries(prep.meta.bibliography)
+            push!(contributions, ("fragment \"$(prep.meta.name)\"", entries))
+            bibliography_keys[slug] = collect(keys(entries))
         end
 
         detach = hasproperty(spec, :detach) ?
@@ -422,7 +651,12 @@ function integrate_fragments(main_src::AbstractString, specs; module_map = Dict{
         )
     end
     modules = unique(reduce(vcat, (f.modules for f in fragments); init = Module[]))
-    return Integration(fragments, modules, FragmentNamespaces(page_slugs))
+    return Integration(
+        fragments,
+        modules,
+        FragmentNamespaces(page_slugs, bibliography_keys),
+        isempty(contributions) ? citations : merge_citations(citations, contributions),
+    )
 end
 
 end

@@ -1,0 +1,6 @@
+name = "Bib Conflict"
+bibliography = "references.bib"
+
+[[pages]]
+title = "Conflict"
+file = "conflict.md"

@@ -1,7 +1,9 @@
 using Test
 using DocumenterFragments
 using DocumenterFragments: build_fragment, integrate_fragments, namespace_ast!
+using DocumenterFragments: scope_bibliography_block!
 import Documenter
+import DocumenterCitations
 import MarkdownAST
 import Markdown
 using Logging
@@ -35,6 +37,12 @@ module FragmentMissing
     function mfun end
 end
 
+module FragmentCite
+    export cited
+    "Function `cited` follows the conventions of [Lamport1994](@cite)."
+    function cited end
+end
+
 module FragmentDoctest
     export qux
     """
@@ -55,6 +63,7 @@ const MODULE_MAP = Dict(
     "FragmentXref" => FragmentXref,
     "FragmentMissing" => FragmentMissing,
     "FragmentDoctest" => FragmentDoctest,
+    "FragmentCite" => FragmentCite,
 )
 
 readbuilt(build, parts...) = read(joinpath(build, parts...), String)
@@ -89,6 +98,21 @@ end
 @testset "namespace_ast! leaves docstring refs and code blocks alone" begin
     @test link_destinations("call [`foo`](@ref) now", "fraga") == ["@ref"]
     @test link_destinations("```@autodocs\nModules = [X]\n```\n", "fraga") == String[]
+end
+
+function scoped_block(code; bib_keys = String[], pages = String[])
+    node = MarkdownAST.Node(MarkdownAST.CodeBlock("@bibliography", code))
+    scope_bibliography_block!(node, (; bib_keys, pages, citations = Ref(0)))
+    return node.element.code
+end
+
+@testset "a @bibliography block is scoped to its fragment for composition" begin
+    fields = "Pages = [\n    \"a.md\",\n]\nCanonical = false\nSorting = :nyt"
+    @test scoped_block(fields * "\nKnuth1984\n") == fields * "\nKnuth1984\n"
+    @test scoped_block("Pages = []\n*\n"; bib_keys = ["Handbook"]) ==
+        "Pages = []\nHandbook\n"
+    @test scoped_block("Canonical = false\nKnuth1984\n"; pages = ["a.md", "b.md"]) ==
+        "Canonical = false\nPages = [\"a.md\", \"b.md\"]\nKnuth1984\n"
 end
 
 @testset "page_meta injects extra lines into the CurrentModule block" begin
@@ -348,4 +372,233 @@ end
         ];
         module_map = MODULE_MAP,
     )
+end
+
+@testset "standalone build resolves a fragment's own bibliography" begin
+    reset_doctestmeta!()
+    build = build_fragment(
+        joinpath(FIXTURES, "fragment_bib");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+    overview = readbuilt(build, "overview", "index.html")
+    docstrings = readbuilt(build, "docstrings", "index.html")
+    references = readbuilt(build, "documenterfragments_references", "index.html")
+
+    @test occursin("for the standalone fragment build only", references)
+    @test occursin("id=\"Knuth1984\"", references)
+    @test occursin("The TeXbook", references)
+    @test occursin("The Not So Short Introduction", overview)
+    @test occursin("href=\"../documenterfragments_references/#Knuth1984\"", overview)
+    @test occursin("href=\"../documenterfragments_references/#Lamport1994\"", docstrings)
+end
+
+@testset "a fragment may not own a canonical bibliography" begin
+    reset_doctestmeta!()
+    @test_throws "cannot own the canonical bibliography" silent_build(
+        joinpath(FIXTURES, "bib_canonical");
+        build = mktempdir(),
+    )
+    @test_throws "cannot own the canonical bibliography" integrate_fragments(
+        joinpath(mktempdir(), "src"),
+        [(; dir = joinpath(FIXTURES, "bib_canonical"), mount = "bibc")],
+    )
+end
+
+@testset "fragments sharing a citation key share one entry" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n\n```@bibliography\n```\n")
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (; dir = joinpath(FIXTURES, "bib_alpha"), mount = "biba"),
+            (; dir = joinpath(FIXTURES, "bib_beta"), mount = "bibb"),
+        ],
+    )
+
+    @test collect(keys(c.citations.entries)) == ["Handbook", "AlphaOnly", "BetaOnly"]
+    @test c.plugins == Documenter.Plugin[c.namespacing, c.citations]
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    index = readbuilt(build, "index.html")
+    alpha = readbuilt(build, "biba", "alpha", "index.html")
+    beta = readbuilt(build, "bibb", "beta", "index.html")
+
+    for key in ["Handbook", "AlphaOnly", "BetaOnly"]
+        @test occursin("id=\"$key\"", index)
+    end
+
+    @test occursin("Only Alpha Cites This", alpha)
+    @test !occursin("Only Beta Cites This", alpha)
+    @test !occursin("id=\"Handbook\"", alpha)
+    @test occursin("href=\"../../#Handbook\"", alpha)
+    @test occursin("href=\"../../#Handbook\"", beta)
+end
+
+@testset "a citation key shared with a different entry errors" begin
+    reset_doctestmeta!()
+    conflicting() = integrate_fragments(
+        joinpath(mktempdir(), "src"),
+        [
+            (; dir = joinpath(FIXTURES, "bib_alpha"), mount = "biba"),
+            (; dir = joinpath(FIXTURES, "bib_conflict"), mount = "bibc"),
+        ],
+    )
+
+    @test_throws "supplied by both fragment \"Bib Alpha\" and fragment \"Bib Conflict\"" conflicting()
+    @test_throws "A Different Handbook Under the Same Key" conflicting()
+end
+
+@testset "an unscoped @bibliography block is scoped to its own fragment" begin
+    reset_doctestmeta!()
+    unscoped(name, page) = let dir = joinpath(mktempdir(), name), src = joinpath(dir, "src", page)
+        cp(joinpath(FIXTURES, name), dir)
+        write(src, replace(read(src, String), r"^Pages = \[\]\n"m => ""))
+        dir
+    end
+
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n\n```@bibliography\n```\n")
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (; dir = unscoped("bib_alpha", "alpha.md"), mount = "biba"),
+            (; dir = unscoped("bib_beta", "beta.md"), mount = "bibb"),
+        ],
+    )
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    alpha = readbuilt(build, "biba", "alpha", "index.html")
+    beta = readbuilt(build, "bibb", "beta", "index.html")
+
+    @test occursin("Only Alpha Cites This", alpha)
+    @test !occursin("Only Beta Cites This", alpha)
+    @test occursin("Only Beta Cites This", beta)
+    @test !occursin("Only Alpha Cites This", beta)
+end
+
+@testset "composition needs a canonical bibliography outside the fragments" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n")
+
+    c = integrate_fragments(
+        main_src,
+        [(; dir = joinpath(FIXTURES, "bib_alpha"), mount = "biba")],
+    )
+
+    @test_throws "the main site must hold the bibliography" Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build = mktempdir(),
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+end
+
+@testset "the main site's own bibliography is merged in too" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(
+        joinpath(main_src, "index.md"),
+        """
+        # Main Site
+
+        The site itself cites [MainSiteWork](@cite).
+
+        ```@bibliography
+        ```
+        """,
+    )
+
+    c = integrate_fragments(
+        main_src,
+        [(; dir = joinpath(FIXTURES, "fragment_bib"), mount = "bib")];
+        module_map = MODULE_MAP,
+        citations = DocumenterCitations.CitationBibliography(
+            joinpath(FIXTURES, "main_site", "references.bib"),
+        ),
+    )
+
+    @test collect(keys(c.citations.entries)) ==
+        ["MainSiteWork", "Knuth1984", "Lamport1994", "Oetiker2021"]
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    index = readbuilt(build, "index.html")
+    @test occursin("id=\"MainSiteWork\"", index)
+    @test occursin("id=\"Lamport1994\"", index)
+    @test occursin(
+        "href=\"../../#Lamport1994\"",
+        readbuilt(build, "bib", "docstrings", "index.html"),
+    )
+end
+
+@testset "fragments without a bibliography get no citation plugin" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    cp(joinpath(FIXTURES, "main_site", "src"), main_src)
+
+    c = integrate_fragments(
+        main_src,
+        [(; dir = joinpath(FIXTURES, "fragment_a"), mount = "fraga")];
+        module_map = MODULE_MAP,
+    )
+
+    @test c.citations === nothing
+    @test c.plugins == Documenter.Plugin[c.namespacing]
 end

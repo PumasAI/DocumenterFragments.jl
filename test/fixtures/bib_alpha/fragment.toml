@@ -1,0 +1,6 @@
+name = "Bib Alpha"
+bibliography = "references.bib"
+
+[[pages]]
+title = "Alpha"
+file = "alpha.md"

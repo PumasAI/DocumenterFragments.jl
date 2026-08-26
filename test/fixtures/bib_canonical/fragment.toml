@@ -1,0 +1,6 @@
+name = "Bib Canonical"
+bibliography = "references.bib"
+
+[[pages]]
+title = "Page"
+file = "page.md"

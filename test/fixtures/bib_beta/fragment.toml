@@ -1,0 +1,6 @@
+name = "Bib Beta"
+bibliography = "references.bib"
+
+[[pages]]
+title = "Beta"
+file = "beta.md"

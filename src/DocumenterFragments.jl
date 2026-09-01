@@ -403,7 +403,9 @@ The fragment's `fragment.toml` supplies its name, the modules to document
 `doctest_setup`, an optional `bibliography` file, and the page tree. Keyword
 arguments mirror the relevant `Documenter.makedocs`/`Documenter.HTML` options
 (`doctest`, `warnonly`, `checkdocs`, `prettyurls`, `plugins`, `page_meta`, ...);
-any extra keywords are forwarded to `makedocs`.
+any extra keywords are forwarded to `makedocs`. Unlike `makedocs`, `checkdocs`
+defaults to `:public`, so unexported internal docstrings do not have to be
+spliced into any page.
 
 A declared `bibliography` is turned into a `CitationBibliography` plugin unless
 `plugins` already carries one. A generated `References` page is appended so that
@@ -417,7 +419,7 @@ function build_fragment(
         module_map = Dict{String, Module}(),
         doctest::Bool = true,
         warnonly = Symbol[],
-        checkdocs::Symbol = :all,
+        checkdocs::Symbol = :public,
         prettyurls::Bool = true,
         repolink = nothing,
         inventory_version = package_version(dir),

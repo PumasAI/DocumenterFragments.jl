@@ -37,6 +37,13 @@ module FragmentMissing
     function mfun end
 end
 
+module FragmentInternal
+    "An internal helper, deliberately not spliced into any page."
+    function ifun end
+end
+
+VERSION >= v"1.11" && include("fragment_public_module.jl")
+
 module FragmentCite
     export cited
     "Function `cited` follows the conventions of [Lamport1994](@cite)."
@@ -62,9 +69,11 @@ const MODULE_MAP = Dict(
     "FragmentB" => FragmentB,
     "FragmentXref" => FragmentXref,
     "FragmentMissing" => FragmentMissing,
+    "FragmentInternal" => FragmentInternal,
     "FragmentDoctest" => FragmentDoctest,
     "FragmentCite" => FragmentCite,
 )
+VERSION >= v"1.11" && (MODULE_MAP["FragmentPublic"] = FragmentPublic)
 
 readbuilt(build, parts...) = read(joinpath(build, parts...), String)
 
@@ -187,6 +196,25 @@ end
     reset_doctestmeta!()
     @test_throws "missing_docs" silent_build(
         joinpath(FIXTURES, "fragment_missing");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "unexported docstrings pass the default checkdocs" begin
+    reset_doctestmeta!()
+    build = build_fragment(
+        joinpath(FIXTURES, "fragment_internal");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+    @test isfile(joinpath(build, "overview", "index.html"))
+end
+
+VERSION >= v"1.11" && @testset "public docstrings still fail the default checkdocs" begin
+    reset_doctestmeta!()
+    @test_throws "missing_docs" silent_build(
+        joinpath(FIXTURES, "fragment_public");
         build = mktempdir(),
         module_map = MODULE_MAP,
     )

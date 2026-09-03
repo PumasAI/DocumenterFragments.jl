@@ -1,0 +1,11 @@
+name = "Fragment Dep"
+modules = ["FragmentDep"]
+composedref_modules = ["FragmentB"]
+
+[[pages]]
+title = "Overview"
+file = "overview.md"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

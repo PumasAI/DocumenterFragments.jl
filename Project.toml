@@ -5,6 +5,7 @@ version = "0.2.0"
 
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
 MarkdownAST = "d0879d2d-cac2-40c8-9cee-1863dc0c7391"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
@@ -23,8 +24,7 @@ julia = "1.10"
 [extras]
 DocumenterCitations = "daee34ce-89f3-4625-b898-19384cb65244"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
-Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["DocumenterCitations", "Logging", "Markdown", "Test"]
+test = ["DocumenterCitations", "Logging", "Test"]

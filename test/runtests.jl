@@ -23,12 +23,41 @@ module FragmentB
     export bar
     "The `bar` function of Fragment B."
     function bar end
+    "The `related` function, see [`bar`](@ref) for details."
+    function related end
+    undocumented() = nothing
 end
 
 module FragmentXref
     export baz
     "The `baz` function of Fragment Xref."
     function baz end
+end
+
+module FragmentDep
+    export dfun, dfun2
+    "The `dfun` function builds on [`FragmentB.bar`](@composedref)."
+    function dfun end
+    const BARNAME = "FragmentB.bar"
+    "The `dfun2` function links [`$(BARNAME)`](@composedref FragmentB.bar) via interpolation."
+    function dfun2 end
+end
+
+module FragmentBAlias
+    import ..FragmentB
+    const bar = FragmentB.bar
+    export bar
+end
+
+module FragmentOuter
+    export ofun
+    "The `ofun` function of Fragment Outer, see the [guide](../guide.md)."
+    function ofun end
+    module Sub
+        export sfun
+        "The `sfun` function of Fragment Outer's submodule."
+        function sfun end
+    end
 end
 
 module FragmentMissing
@@ -68,6 +97,10 @@ const MODULE_MAP = Dict(
     "FragmentA" => FragmentA,
     "FragmentB" => FragmentB,
     "FragmentXref" => FragmentXref,
+    "FragmentDep" => FragmentDep,
+    "FragmentBAlias" => FragmentBAlias,
+    "FragmentOuter" => FragmentOuter,
+    "FragmentOuter.Sub" => FragmentOuter.Sub,
     "FragmentMissing" => FragmentMissing,
     "FragmentInternal" => FragmentInternal,
     "FragmentDoctest" => FragmentDoctest,
@@ -402,6 +435,311 @@ end
     )
 end
 
+function composedref_fragment(md; composedref_modules = ["FragmentB"])
+    dir = mktempdir()
+    mkpath(joinpath(dir, "src"))
+    write(
+        joinpath(dir, "fragment.toml"),
+        """
+        name = "Dep Check"
+        composedref_modules = [$(join(repr.(composedref_modules), ", "))]
+
+        [[pages]]
+        title = "Page"
+        file = "page.md"
+        """,
+    )
+    write(joinpath(dir, "src", "page.md"), "# Page\n\n$md\n")
+    return dir
+end
+
+@testset "standalone composedrefs link to a generated composition docstrings page" begin
+    reset_doctestmeta!()
+    build = mktempdir()
+    build_fragment(joinpath(FIXTURES, "fragment_dep"); build, module_map = MODULE_MAP)
+
+    href = "href=\"../documenterfragments_composedrefs/#Main.FragmentB.bar\""
+    overview = readbuilt(build, "overview", "index.html")
+    @test occursin("<a $href><code>FragmentB.bar</code></a>", overview)
+    @test occursin("<a $href>the bar function</a>", overview)
+    docstrings = readbuilt(build, "docstrings", "index.html")
+    @test occursin(href, docstrings)
+    @test occursin("links <a $href><code>FragmentB.bar</code></a> via interpolation", docstrings)
+
+    generated = readbuilt(build, "documenterfragments_composedrefs", "index.html")
+    @test occursin("for the standalone fragment build only", generated)
+    @test occursin("id=\"Main.FragmentB.bar\"", generated)
+    @test occursin("The <code>bar</code> function of Fragment B.", generated)
+    @test occursin("The <code>related</code> function, see <code>bar</code> for details.", generated)
+end
+
+@testset "an invalid composedref fails the standalone build" begin
+    reset_doctestmeta!()
+    check(md; kwargs...) = silent_build(
+        composedref_fragment(md; kwargs...);
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+
+    @test_throws "points into module \"FragmentA\"" check("[`FragmentA.foo`](@composedref)")
+    @test_throws "no `composedref_modules`" check(
+        "[`FragmentB.bar`](@composedref)";
+        composedref_modules = String[],
+    )
+    @test_throws "is not defined" check("[`FragmentB.nonexistent`](@composedref)")
+    @test_throws "has no docstring" check("[`FragmentB.undocumented`](@composedref)")
+    @test_throws "must be qualified" check("[`bar`](@composedref)")
+    @test_throws "has no target" check("[bar](@composedref)")
+    @test_throws "cross_references" check("[x](@composedreffoo)")
+end
+
+@testset "a plain @ref into a composedref module fails the standalone build" begin
+    reset_doctestmeta!()
+    @test_throws "cross_references" silent_build(
+        composedref_fragment("[`FragmentB.bar`](@composedref) but also [`FragmentB.bar`](@ref)");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "aliased composedref targets are spliced once" begin
+    reset_doctestmeta!()
+    build = mktempdir()
+    build_fragment(
+        composedref_fragment(
+            "Both [`FragmentB.bar`](@composedref) and [`FragmentBAlias.bar`](@composedref).";
+            composedref_modules = ["FragmentB", "FragmentBAlias"],
+        );
+        build,
+        module_map = MODULE_MAP,
+    )
+    generated = readbuilt(build, "documenterfragments_composedrefs", "index.html")
+    @test length(collect(eachmatch(r"id=\"Main\.FragmentB\.bar\"", generated))) == 1
+    page = readbuilt(build, "page", "index.html")
+    href = r"href=\"\.\./documenterfragments_composedrefs/#Main\.FragmentB\.bar\""
+    @test length(collect(eachmatch(href, page))) == 2
+end
+
+@testset "submodule targets resolve and docstring-relative links are demoted" begin
+    reset_doctestmeta!()
+    build = mktempdir()
+    build_fragment(
+        composedref_fragment(
+            "Uses [`FragmentOuter.ofun`](@composedref) and [`FragmentOuter.Sub.sfun`](@composedref).";
+            composedref_modules = ["FragmentOuter"],
+        );
+        build,
+        module_map = MODULE_MAP,
+    )
+    generated = readbuilt(build, "documenterfragments_composedrefs", "index.html")
+    @test occursin("id=\"Main.FragmentOuter.ofun\"", generated)
+    @test occursin("id=\"Main.FragmentOuter.Sub.sfun\"", generated)
+    @test occursin("see the guide.", generated)
+    @test !occursin("guide.md", generated)
+end
+
+@testset "a fragment shipping the generated composedrefs page name errors" begin
+    reset_doctestmeta!()
+    dir = composedref_fragment("[`FragmentB.bar`](@composedref)")
+    write(joinpath(dir, "src", "documenterfragments_composedrefs.md"), "# Mine\n")
+    @test_throws "already ships that page" silent_build(
+        dir;
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "integrated composedrefs resolve to the owning fragment's docstrings" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n")
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (; dir = joinpath(FIXTURES, "fragment_dep"), mount = "fragdep"),
+            (; dir = joinpath(FIXTURES, "fragment_b"), mount = "fragb"),
+        ];
+        module_map = MODULE_MAP,
+    )
+    @test c.plugins == Documenter.Plugin[c.namespacing, c.composedrefs]
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = c.modules,
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    href = "href=\"../../fragb/docstrings/#Main.FragmentB.bar\""
+    overview = readbuilt(build, "fragdep", "overview", "index.html")
+    @test occursin("<a $href><code>FragmentB.bar</code></a>", overview)
+    @test occursin("<a $href>the bar function</a>", overview)
+    @test occursin(href, readbuilt(build, "fragdep", "docstrings", "index.html"))
+end
+
+@testset "a composedref module provided by nobody fails integration" begin
+    reset_doctestmeta!()
+    @test_throws "nor `main_modules` provides" integrate_fragments(
+        joinpath(mktempdir(), "src"),
+        [(; dir = joinpath(FIXTURES, "fragment_dep"), mount = "fragdep")];
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "a submodule composedref module is provided through its parent" begin
+    reset_doctestmeta!()
+    frag = composedref_fragment(
+        "[`FragmentOuter.Sub.sfun`](@composedref)";
+        composedref_modules = ["FragmentOuter.Sub"],
+    )
+    owner = mktempdir()
+    mkpath(joinpath(owner, "src"))
+    write(
+        joinpath(owner, "fragment.toml"),
+        """
+        name = "Outer Owner"
+        modules = ["FragmentOuter"]
+
+        [[pages]]
+        title = "Page"
+        file = "page.md"
+        """,
+    )
+    write(joinpath(owner, "src", "page.md"), "# Page\n")
+
+    main_src() = let d = joinpath(mktempdir(), "src")
+        mkpath(d)
+        write(joinpath(d, "index.md"), "# Main Site\n")
+        d
+    end
+
+    c = integrate_fragments(
+        main_src(),
+        [(; dir = frag, mount = "dep"), (; dir = owner, mount = "outer")];
+        module_map = MODULE_MAP,
+    )
+    @test c isa DocumenterFragments.Integration
+
+    @test_throws "nor `main_modules` provides" integrate_fragments(
+        main_src(),
+        [(; dir = frag, mount = "dep")];
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "a composedref in a docstring on a main-site page errors clearly" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(
+        joinpath(main_src, "index.md"),
+        "# Main Site\n\n```@autodocs\nModules = [FragmentDep]\n```\n",
+    )
+    c = integrate_fragments(main_src, []; module_map = MODULE_MAP)
+
+    @test_throws "can only be authored within fragments" with_logger(NullLogger()) do
+        Base.invokelatest(
+            Documenter.makedocs;
+            sitename = "Main Site",
+            modules = [FragmentDep],
+            source = main_src,
+            build = mktempdir(),
+            doctest = false,
+            warnonly = Symbol[],
+            remotes = nothing,
+            plugins = c.plugins,
+            format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+            pages = Any["Home" => "index.md"],
+        )
+    end
+end
+
+@testset "the main site can provide composedref docstrings via main_modules" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(
+        joinpath(main_src, "index.md"),
+        "# Main Site\n\n```@docs\nFragmentB.bar\nFragmentB.related\n```\n",
+    )
+
+    c = integrate_fragments(
+        main_src,
+        [(; dir = joinpath(FIXTURES, "fragment_dep"), mount = "fragdep")];
+        module_map = MODULE_MAP,
+        main_modules = [FragmentB],
+    )
+
+    build = mktempdir()
+    Base.invokelatest(
+        Documenter.makedocs;
+        sitename = "Main Site",
+        modules = [c.modules; FragmentB],
+        source = main_src,
+        build,
+        doctest = false,
+        warnonly = Symbol[],
+        remotes = nothing,
+        plugins = c.plugins,
+        format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+        pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+    )
+
+    href = "href=\"../../#Main.FragmentB.bar\""
+    overview = readbuilt(build, "fragdep", "overview", "index.html")
+    @test occursin("<a $href><code>FragmentB.bar</code></a>", overview)
+    @test occursin("<a $href>the bar function</a>", overview)
+end
+
+@testset "a composedref to an unrendered docstring fails the composed build" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    mkpath(main_src)
+    write(joinpath(main_src, "index.md"), "# Main Site\n")
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (;
+                dir = composedref_fragment(
+                    "[`FragmentMissing.mfun`](@composedref)";
+                    composedref_modules = ["FragmentMissing"],
+                ),
+                mount = "dep",
+            ),
+            (; dir = joinpath(FIXTURES, "fragment_missing"), mount = "missing"),
+        ];
+        module_map = MODULE_MAP,
+    )
+
+    @test_throws "not included on any page of the composed site" with_logger(NullLogger()) do
+        Base.invokelatest(
+            Documenter.makedocs;
+            sitename = "Main Site",
+            modules = c.modules,
+            source = main_src,
+            build = mktempdir(),
+            doctest = false,
+            warnonly = Symbol[],
+            checkdocs = :none,
+            remotes = nothing,
+            plugins = c.plugins,
+            format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+            pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+        )
+    end
+end
+
 @testset "standalone build resolves a fragment's own bibliography" begin
     reset_doctestmeta!()
     build = build_fragment(
@@ -448,7 +786,7 @@ end
     )
 
     @test collect(keys(c.citations.entries)) == ["Handbook", "AlphaOnly", "BetaOnly"]
-    @test c.plugins == Documenter.Plugin[c.namespacing, c.citations]
+    @test c.plugins == Documenter.Plugin[c.namespacing, c.composedrefs, c.citations]
 
     build = mktempdir()
     Base.invokelatest(
@@ -628,5 +966,5 @@ end
     )
 
     @test c.citations === nothing
-    @test c.plugins == Documenter.Plugin[c.namespacing]
+    @test c.plugins == Documenter.Plugin[c.namespacing, c.composedrefs]
 end

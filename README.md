@@ -39,6 +39,7 @@ name = "Widgets"                          # section title in the main site and s
 modules = ["Widgets", "WidgetsCore"]      # drives @autodocs coverage / checkdocs
 doctest_setup = "using Widgets, TestData" # applied via DocMeta.setdocmeta!
 bibliography = "references.bib"           # optional, relative to docs/
+composedref_modules = ["WidgetsBase"]         # optional, see "Linking to a dependency's docstrings"
 
 [[pages]]
 title = "Introduction"
@@ -241,12 +242,77 @@ placement (mounts, and a unique namespace per fragment) and validates
 cross-fragment policy. In v1 this is intentional: fragments stay decoupled and do
 not coordinate anchor names.
 
-Future extension (not implemented): cross-fragment links via DocumenterInterLinks.
-Documenter writes an `objects.inv` inventory per build, and DocumenterInterLinks
-can load another fragment's inventory (including from a committed local `.toml`)
-and resolve `[text](@extref widgets-...)` links against it. The per-fragment
-namespacing already makes every anchor globally unique, so this can be added
-without redesign.
+Docstring links into another fragment's modules are the one supported exception,
+via `@composedref` (see "Linking to a dependency's docstrings"). Section links across
+fragments remain unsupported; if ever wanted, DocumenterInterLinks could resolve
+them against a deployed site's `objects.inv` inventory, and the per-fragment
+namespacing already makes every anchor globally unique, so that could be added
+without redesign. It is not the mechanism for docstring links between fragments,
+though: fragments deploy no docs of their own, so the only inventory available
+would be the previously deployed composed site, which cannot validate against the
+dependency versions actually being built and cannot cover names added since the
+last deploy.
+
+## Linking to a dependency's docstrings
+
+A fragment's `@ref` links deliberately resolve only against its own modules (see
+"Module scope"), so they cannot reach the docstrings of another package. For
+packages the fragment depends on anyway (typically the central package whose
+objects it builds on), `@composedref` links provide that. The fragment declares which
+modules it may link into:
+
+```toml
+name = "WidgetsPlots"
+modules = ["WidgetsPlots"]
+composedref_modules = ["Widgets"]
+```
+
+and its pages (and docstrings) link with a qualified target, either as the link's
+code text or as an explicit name after `@composedref`:
+
+```markdown
+Plots the output of [`Widgets.make_widget`](@composedref), see also
+[the widget builder](@composedref Widgets.make_widget).
+```
+
+The declared modules must be loadable in the fragment's docs environment, which
+for a real dependency they already are; nothing is fetched and no inventory is
+involved. That makes the declaration the policy surface: linking into a package
+means adding it to `composedref_modules` (and, if it was not one already, to the docs
+environment), a reviewable statement of coupling rather than something that works
+silently because a module happens to be loaded.
+
+The fragment's own build validates every `@composedref` against the loaded module: the
+target must be qualified, its module declared, and the binding must carry a
+docstring, in exactly the dependency version the docs environment resolves, so
+developing against an unreleased dependency works like any other dev workflow.
+Since no fragment page holds the dependency's docstrings, the standalone build
+generates a `Docstrings Available at Composition` page collecting exactly the referenced ones
+(marked as standalone-only, like the generated home page), and the links lead
+there, so a preview shows what each link will point at.
+
+At composition, each `@composedref` is resolved into a real link to the docstring's
+anchor on the page that carries it. That page can belong to the fragment owning the
+target module, or to the main site itself: while a site migrates to fragments
+piecemeal, the central package's docstrings typically still live on main-site
+pages, and the integrator declares that with
+
+```julia
+main_mods = [Widgets]
+c = integrate_fragments(main_src, specs; main_modules = main_mods)
+makedocs(; modules = [c.modules; main_mods], ...)
+```
+
+Two things are enforced at composition: `integrate_fragments` errors if a declared
+composedref module is neither owned by a fragment nor listed in `main_modules`
+(a submodule counts as provided by whoever provides its parent), and
+the build errors if the target's docstring is rendered on no composed page (e.g.
+filtered out by whoever provides it). So a fragment can be green while the
+composition is red, but only through placement changes on the providing side, and
+the error names the link, page and target.
+
+Targets are docstrings only; linking a dependency's *sections* is not supported
+(a module carries no section anchors to validate against).
 
 ## Fragment bibliographies
 

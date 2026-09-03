@@ -2,6 +2,7 @@ module DocumenterFragments
 
 import TOML
 import Documenter
+import Markdown
 import MarkdownAST
 using Documenter: makedocs, DocMeta
 
@@ -12,6 +13,7 @@ end
 struct FragmentMeta
     name::String
     modules::Vector{String}
+    composedref_modules::Vector{String}
     doctest_setup::Union{Nothing, String}
     bibliography::Union{Nothing, String}
     page_entries::Vector{Any}
@@ -22,11 +24,12 @@ function read_fragment(dir::AbstractString)
     toml = TOML.parsefile(joinpath(dir, "fragment.toml"))
     name = toml["name"]
     modules = collect(String, get(toml, "modules", String[]))
+    composedref_modules = collect(String, get(toml, "composedref_modules", String[]))
     setup = get(toml, "doctest_setup", nothing)
     bib = get(toml, "bibliography", nothing)
     bibfile = bib === nothing ? nothing : joinpath(dir, bib)
     entries = collect(Any, get(toml, "pages", Any[]))
-    return FragmentMeta(name, modules, setup, bibfile, entries, String(dir))
+    return FragmentMeta(name, modules, composedref_modules, setup, bibfile, entries, String(dir))
 end
 
 function slugify(s)
@@ -249,18 +252,314 @@ function sibling_pages(path, ns, page_slugs)
     return [relpath(page, here) for (page, slug) in page_slugs if slug == ns]
 end
 
+struct FragmentComposedRefs <: Documenter.Plugin
+    integrated::Bool
+    modules::Dict{String, Vector{Module}}
+end
+
+const STANDALONE_COMPOSEDREFS = ""
+
+is_composedref(el) =
+    el isa MarkdownAST.Link && occursin(r"^@composedref(\s|$)", el.destination)
+
+function composedref_target(node, where)
+    rest = strip(chopprefix(node.element.destination, "@composedref"))
+    isempty(rest) || return String(rest)
+    is_docstring_ref(node) && return first(node.children).element.code
+    error(
+        "The `@composedref` link \"$(inline_text(node))\" $where has no target. " *
+            "Use code text ([`Widgets.make_widget`](@composedref)) or an explicit name " *
+            "([the widget builder](@composedref Widgets.make_widget)).",
+    )
+end
+
+function composedref_binding(target, mods, where)
+    parts = Symbol.(split(target, '.'))
+    length(parts) >= 2 || error(
+        "`@composedref` target \"$target\" $where must be qualified with the module " *
+            "supplying it, e.g. \"Widgets.make_widget\".",
+    )
+    i = findfirst(m -> nameof(m) === parts[1], mods)
+    i === nothing && error(
+        "`@composedref` target \"$target\" $where points into module \"$(parts[1])\", " *
+            "but the fragment declares " *
+            (
+            isempty(mods) ? "no `composedref_modules`" :
+                "only $(join(("\"$(nameof(m))\"" for m in mods), ", ")) as `composedref_modules`"
+        ) *
+            "; declare the module in fragment.toml.",
+    )
+    mod = mods[i]
+    for p in parts[2:(end - 1)]
+        isdefined(mod, p) && getfield(mod, p) isa Module || error(
+            "`@composedref` target \"$target\" $where: \"$p\" is not a submodule of \"$mod\".",
+        )
+        mod = getfield(mod, p)
+    end
+    sym = parts[end]
+    # aliasof: a target written through a reexport or const alias must yield the
+    # canonical binding, so it dedupes with (and anchors identically to) the
+    # directly-written form.
+    binding = Documenter.DocSystem.aliasof(Documenter.DocSystem.binding(mod, sym))
+    isempty(Documenter.DocSystem.getdocs(binding)) && error(
+        "`@composedref` target \"$target\" $where: `$sym` " *
+            (isdefined(mod, sym) ? "has no docstring" : "is not defined") *
+            " in module \"$mod\".",
+    )
+    return binding
+end
+
+# Both builds hold a page with the target docstring (composed, the page of the
+# fragment owning the module; standalone, the generated page of docstrings
+# available at composition), so a composedref is resolved into a link to its
+# anchor there. The links
+# are resolved here rather than left to Documenter's `@ref` machinery, since that
+# resolves relative to a module scope (the page's `CurrentModule`, or for a
+# docstring-embedded ref the docstring's module) in which the dependency is not
+# necessarily a reachable name.
+function resolve_composedref!(node, ctx)
+    target = composedref_target(node, ctx.where)
+    ctx.mods === nothing && error(
+        "The `@composedref` link \"$target\" $(ctx.where) does not belong to a fragment, " *
+            "so no `composedref_modules` apply. Composedref links can only be authored " *
+            "within fragments; on a main-site page, use a plain docstring `@ref` instead.",
+    )
+    binding = composedref_binding(target, ctx.mods, ctx.where)
+    object = Documenter.find_object(ctx.doc, binding, Union{})
+    object === nothing && error(
+        "`@composedref` target \"$target\" $(ctx.where) has a docstring, but it is " *
+            (
+            ctx.integrated ?
+                "not included on any page of the composed site; whoever provides " *
+                "\"$(binding.mod)\" (the fragment owning it, or the main site's own pages) " *
+                "must place it on one of its docstring pages." :
+                "missing from the generated \"$COMPOSEDREFS_PAGE\" page. This can happen " *
+                "when the link only comes into existence during the build (e.g. produced " *
+                "by an `@eval` block), which the pre-build scan cannot see; otherwise " *
+                "please report a bug in DocumenterFragments."
+        ),
+    )
+    docsnode = ctx.doc.internal.objects[object]
+    pagekey = relpath(docsnode.page.build, ctx.doc.user.build)
+    targetpage = ctx.doc.blueprint.pages[pagekey]
+    node.element = Documenter.PageLink(targetpage, Documenter.slugify(object))
+    return
+end
+
+function resolve_composedrefs!(node, ctx)
+    el = node.element
+    if is_composedref(el)
+        resolve_composedref!(node, ctx)
+        return
+    elseif el isa Documenter.DocsNode
+        inner = (; ctx..., where = "in a docstring included on page \"$(ctx.path)\"")
+        for mdast in el.mdasts
+            resolve_composedrefs!(mdast, inner)
+        end
+    end
+    for c in collect(node.children)
+        resolve_composedrefs!(c, ctx)
+    end
+    return
+end
+
+# Runs after ExpandTemplates (2.0), so composedrefs inside spliced docstrings are seen
+# and the docstring objects to link to are registered, and before CrossReferences
+# (3.0), which must never see a raw `@composedref`.
+abstract type FragmentComposedRefResolution <: Documenter.Builder.DocumentPipeline end
+Documenter.Selectors.order(::Type{FragmentComposedRefResolution}) = 2.5
+function Documenter.Selectors.runner(::Type{FragmentComposedRefResolution}, doc)
+    haskey(doc.plugins, FragmentComposedRefs) || return
+    composedrefs = Documenter.getplugin(doc, FragmentComposedRefs)
+    if !composedrefs.integrated && haskey(doc.blueprint.pages, COMPOSEDREFS_PAGE)
+        page = doc.blueprint.pages[COMPOSEDREFS_PAGE]
+        mods = get(composedrefs.modules, STANDALONE_COMPOSEDREFS, Module[])
+        for child in collect(page.mdast.children)
+            is_composedrefdocs(child.element) &&
+                expand_composedrefdocs!(child, page, mods, doc)
+        end
+    end
+    page_slugs = haskey(doc.plugins, FragmentNamespaces) ?
+        Documenter.getplugin(doc, FragmentNamespaces).page_slugs : Pair{String, String}[]
+    for (path, page) in doc.blueprint.pages
+        ns = composedrefs.integrated ? namespace_for(path, page_slugs) : STANDALONE_COMPOSEDREFS
+        mods = ns === nothing ? nothing : get(composedrefs.modules, ns, Module[])
+        ctx = (; integrated = composedrefs.integrated, mods, path, where = "on page \"$path\"", doc)
+        for child in collect(page.mdast.children)
+            resolve_composedrefs!(child, ctx)
+        end
+    end
+    return
+end
+
+function collect_composedref_targets!(targets, node, mods, where)
+    if is_composedref(node.element)
+        target = composedref_target(node, where)
+        composedref_binding(target, mods, where)
+        push!(targets, target)
+        return
+    end
+    for c in node.children
+        collect_composedref_targets!(targets, c, mods, where)
+    end
+    return
+end
+
+# The docstrings are scanned in their assembled form (`parsedoc`), the same one
+# the pipeline stage later sees, so a link spanning an interpolation boundary in
+# the raw docstring source is not missed.
+function module_docstring_asts!(asts, mod)
+    meta = Base.Docs.meta(mod; autoinit = false)
+    if meta !== nothing
+        for multidoc in values(meta)
+            for docstr in values(multidoc.docs)
+                push!(asts, convert(MarkdownAST.Node, Documenter.DocSystem.parsedoc(docstr)))
+            end
+        end
+    end
+    for name in names(mod; all = true)
+        isdefined(mod, name) || continue
+        sub = getfield(mod, name)
+        sub isa Module && sub !== mod && parentmodule(sub) === mod &&
+            module_docstring_asts!(asts, sub)
+    end
+    return asts
+end
+
+markdown_ast(md) = convert(MarkdownAST.Node, Markdown.parse(md))
+
+function composedref_targets(srcdir, own_mods, composedref_mods)
+    targets = String[]
+    for path in markdown_files(srcdir)
+        where = "on page \"$(relpath(path, srcdir))\""
+        collect_composedref_targets!(
+            targets, markdown_ast(read(path, String)), composedref_mods, where,
+        )
+    end
+    for mod in own_mods
+        where = "in a docstring of module \"$mod\""
+        for ast in module_docstring_asts!(MarkdownAST.Node[], mod)
+            collect_composedref_targets!(targets, ast, composedref_mods, where)
+        end
+    end
+    return unique!(targets)
+end
+
+# Obscure enough that a fragment can still have a page of its own called
+# "composedrefs.md"; it only ever exists in the standalone build.
+const COMPOSEDREFS_PAGE = "documenterfragments_composedrefs.md"
+
+composedrefs_placeholder(targets) = """
+# Docstrings Available at Composition
+
+This page was generated by [DocumenterFragments.jl](https://github.com/PumasAI/DocumenterFragments.jl)
+for the standalone fragment build only. It collects the docstrings this fragment
+references with `@composedref` links, so the links can be followed and checked
+here. In the composed site the links lead to the pages of the fragment owning
+each module, and this page is not present. Links within the collected docstrings
+lead to their home doc set and are shown as plain text here.
+
+```@composedrefdocs
+$(join(targets, '\n'))
+```
+"""
+
+is_composedrefdocs(el) =
+    el isa MarkdownAST.CodeBlock && startswith(el.info, "@composedrefdocs")
+
+function unwrap_link!(node)
+    for child in collect(node.children)
+        MarkdownAST.insert_before!(node, child)
+    end
+    MarkdownAST.unlink!(node)
+    return
+end
+
+# The spliced copies are a standalone-only preview, so links that only work in
+# their home doc set (`@ref`s among the dependency's own docstrings, `@cite`s
+# into its bibliography, relative links to its pages or files) are flattened to
+# their display content; only links with a scheme (https, mailto, ...) survive.
+function demote_docstring_links!(node)
+    el = node.element
+    if el isa MarkdownAST.Link && !occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", el.destination)
+        unwrap_link!(node)
+        return
+    end
+    for c in collect(node.children)
+        demote_docstring_links!(c)
+    end
+    return
+end
+
+# Replicates what Documenter's `@docs` expander does for each docstring, without
+# its restriction to `modules`, which the composedref modules are deliberately
+# not part of: their docstring coverage is not this fragment's to check, and
+# their doctests must not run here.
+function expand_composedrefdocs!(node, page, mods, doc)
+    codeblock = node.element
+    where = "on page \"$COMPOSEDREFS_PAGE\""
+    docsnodes = MarkdownAST.Node[]
+    for line in split(codeblock.code, '\n'; keepempty = false)
+        target = String(strip(line))
+        binding = composedref_binding(target, mods, where)
+        object = Documenter.Object(binding, Union{})
+        # Two targets can normalize to one binding (a reexported alias, or a
+        # module in both `modules` and `composedref_modules` whose docstring a
+        # fragment page already placed); the object is spliced only once and
+        # every link resolves to that one copy.
+        haskey(doc.internal.objects, object) && continue
+        anchor = Documenter.anchor_add!(
+            doc.internal.docs, object, Documenter.slugify(object), page.build,
+        )
+        docsnode = Documenter.DocsNode(anchor, object, page)
+        for docstr in Documenter.DocSystem.getdocs(binding)
+            md = Documenter.DocSystem.parsedoc(docstr)
+            ast = convert(MarkdownAST.Node, md)
+            doc.user.highlightsig && Documenter.highlightsig!(ast)
+            Documenter.recursive_heading_to_bold!(ast)
+            demote_docstring_links!(ast)
+            push!(docsnode.mdasts, ast)
+            push!(docsnode.results, docstr)
+            push!(docsnode.metas, md.meta)
+        end
+        push!(get!(doc.internal.bindings, binding, Documenter.Object[]), object)
+        doc.internal.objects[object] = docsnode
+        push!(docsnodes, MarkdownAST.Node(docsnode))
+    end
+    node.element = Documenter.DocsNodesBlock(codeblock)
+    for docsnode in docsnodes
+        push!(node.children, docsnode)
+    end
+    return
+end
+
+function add_composedrefs_page!(pages, srcdir, name, targets)
+    path = joinpath(srcdir, COMPOSEDREFS_PAGE)
+    isfile(path) && error(
+        "Fragment \"$name\" uses `@composedref` links, so the standalone build needs to " *
+            "generate \"$COMPOSEDREFS_PAGE\", but the fragment already ships that page. " *
+            "Rename it.",
+    )
+    write(path, composedrefs_placeholder(targets))
+    return push!(pages, "Docstrings Available at Composition" => COMPOSEDREFS_PAGE)
+end
+
 function load_module(name, module_map)
     haskey(module_map, name) && return module_map[name]
     sym = Symbol(name)
     return isdefined(Main, sym) ? getfield(Main, sym) : Base.require(Main, sym)
 end
 
-resolve_modules(meta::FragmentMeta, module_map) =
-    Module[load_module(n, module_map) for n in meta.modules]
+load_modules(names, module_map) = Module[load_module(n, module_map) for n in names]
+
+resolve_modules(meta::FragmentMeta, module_map) = load_modules(meta.modules, module_map)
 
 scope_identifier(key) =
     Symbol("DocumenterFragmentScope_" * replace(String(key), r"[^0-9A-Za-z_]" => "_"))
 
+# Composedref modules are deliberately not made reachable from the scope: a plain
+# `@ref` must never resolve into them, so a fragment cannot pass standalone with a
+# ref that only the composed site could carry.
 function make_scope(mods, key)
     name = scope_identifier(key)
     scope = Module(name)
@@ -412,6 +711,11 @@ A declared `bibliography` is turned into a `CitationBibliography` plugin unless
 the fragment's citations resolve in the standalone build; any `@bibliography`
 blocks the fragment carries itself must be `Canonical = false`, since the
 composed site owns the canonical bibliography.
+
+`@composedref` links into modules declared as `composedref_modules` are validated
+against the loaded modules and resolved to a generated `Docstrings Available at
+Composition` page collecting the referenced docstrings, standing in for the pages
+of the fragments that carry them in the composed site.
 """
 function build_fragment(
         dir::AbstractString;
@@ -430,6 +734,7 @@ function build_fragment(
     meta = read_fragment(dir)
     meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
+    composedref_mods = load_modules(meta.composedref_modules, module_map)
     apply_doctestsetup!(meta, mods)
     scopename = make_scope(mods, meta.name)
 
@@ -450,6 +755,8 @@ function build_fragment(
         pushfirst!(pages, "Home" => "index.md")
     end
     meta.bibliography === nothing || add_references_page!(pages, staged_src, meta.name)
+    targets = composedref_targets(staged_src, mods, composedref_mods)
+    isempty(targets) || add_composedrefs_page!(pages, staged_src, meta.name, targets)
     set_currentmodule!(staged_src, scopename; page_meta)
 
     # invokelatest: make_scope bound the scope module into Main during this call, so
@@ -464,7 +771,10 @@ function build_fragment(
         doctest,
         warnonly,
         checkdocs,
-        plugins = fragment_plugins(meta, plugins),
+        plugins = vcat(
+            fragment_plugins(meta, plugins),
+            FragmentComposedRefs(false, Dict(STANDALONE_COMPOSEDREFS => composedref_mods)),
+        ),
         remotes = nothing,
         format = Documenter.HTML(; prettyurls, edit_link = nothing, repolink, inventory_version),
         kwargs...,
@@ -505,6 +815,7 @@ function prepare_fragment!(
     meta = read_fragment(dir)
     meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
+    composedref_mods = load_modules(meta.composedref_modules, module_map)
     apply_doctestsetup!(meta, mods)
     scopename = make_scope(mods, slug)
 
@@ -521,6 +832,7 @@ function prepare_fragment!(
         pages = meta.name => documenter_pages(meta; prefix = mount),
         page_paths = [replace(joinpath(mount, rel), '\\' => '/') for rel in copied if endswith(rel, ".md")],
         modules = mods,
+        composedref_modules = composedref_mods,
         meta = meta,
     )
 end
@@ -535,6 +847,32 @@ function validate_module_ownership(specs)
             )
             owner[m] = spec.mount
         end
+    end
+    return
+end
+
+function is_module_or_ancestor(candidate, mod)
+    while true
+        candidate === mod && return true
+        parent = parentmodule(mod)
+        parent === mod && return false
+        mod = parent
+    end
+end
+
+# Provision is checked on the loaded modules themselves, not on names, so
+# same-named modules stay distinct and a submodule (`Widgets.Internals`) counts as
+# provided by whoever provides its parent.
+function validate_composedref_provision(checks, providers)
+    for (fragname, mod) in checks
+        any(p -> is_module_or_ancestor(p, mod), providers) || error(
+            "Fragment \"$fragname\" declares composedref module \"$mod\", but neither a " *
+                "fragment in this composition nor `main_modules` provides that module (or " *
+                "a parent of it), so its `@composedref` targets would have no docstrings " *
+                "to land on. Include the fragment documenting it, or pass " *
+                "`main_modules = [$mod]` to `integrate_fragments` if the main site's own " *
+                "pages document it.",
+        )
     end
     return
 end
@@ -568,14 +906,15 @@ struct Integration
     fragments::Vector{IntegratedFragment}
     modules::Vector{Module}
     namespacing::FragmentNamespaces
+    composedrefs::FragmentComposedRefs
     citations::Union{Nothing, Documenter.Plugin}
     plugins::Vector{Documenter.Plugin}
 end
 
-function Integration(fragments, modules, namespacing, citations)
-    plugins = Documenter.Plugin[namespacing]
+function Integration(fragments, modules, namespacing, composedrefs, citations)
+    plugins = Documenter.Plugin[namespacing, composedrefs]
     citations === nothing || push!(plugins, citations)
-    return Integration(fragments, modules, namespacing, citations, plugins)
+    return Integration(fragments, modules, namespacing, composedrefs, citations, plugins)
 end
 
 function disambiguate!(taken, base)
@@ -607,20 +946,29 @@ more than one fragment must carry the same entry everywhere, or the merge errors
 Pass an existing plugin as `citations` to contribute the main site's own
 bibliography and its style.
 
+A fragment's `@composedref` links are resolved into ordinary docstring links, to
+the pages of whichever fragment owns the target module, or to the main site's own
+docstring pages for modules listed in `main_modules` (pass the same modules to
+`makedocs`). Every declared `composedref_module` must be provided one of these two
+ways, or the integration errors.
+
 Returns an [`Integration`](@ref) whose `fragments` are [`IntegratedFragment`](@ref)s
 (each carrying `pages`, `detached`, `modules`, ...), the combined `modules`, and the
-`plugins` to pass to `makedocs` so anchors, cross-references and citations stay
-unique across fragments.
+`plugins` to pass to `makedocs` so anchors, cross-references, dependency links and
+citations stay unique and resolvable across fragments.
 """
 function integrate_fragments(
         main_src::AbstractString,
         specs;
         module_map = Dict{String, Module}(),
         citations = nothing,
+        main_modules = Module[],
     )
     validate_module_ownership(specs)
     page_slugs = Pair{String, String}[]
     bibliography_keys = Dict{String, Vector{String}}()
+    composedref_modules = Dict{String, Vector{Module}}()
+    composedref_checks = Tuple{String, Module}[]
     contributions = Tuple{String, Any}[]
     slugs_taken = Set{String}()
     fragments = map(specs) do spec
@@ -629,6 +977,10 @@ function integrate_fragments(
         prep = prepare_fragment!(main_src, spec.dir, spec.mount; slug, module_map, page_meta)
         for path in prep.page_paths
             push!(page_slugs, path => slug)
+        end
+        isempty(prep.composedref_modules) || (composedref_modules[slug] = prep.composedref_modules)
+        for mod in prep.composedref_modules
+            push!(composedref_checks, (prep.meta.name, mod))
         end
         if prep.meta.bibliography !== nothing
             entries = read_entries(prep.meta.bibliography)
@@ -653,10 +1005,12 @@ function integrate_fragments(
         )
     end
     modules = unique(reduce(vcat, (f.modules for f in fragments); init = Module[]))
+    validate_composedref_provision(composedref_checks, [modules; main_modules])
     return Integration(
         fragments,
         modules,
         FragmentNamespaces(page_slugs, bibliography_keys),
+        FragmentComposedRefs(true, composedref_modules),
         isempty(contributions) ? citations : merge_citations(citations, contributions),
     )
 end

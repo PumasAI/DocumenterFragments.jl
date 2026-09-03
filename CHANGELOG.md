@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 - Breaking: `build_fragment` now defaults to `checkdocs = :public` instead of `:all` [#10](https://github.com/PumasAI/DocumenterFragments.jl/pull/10).
+- Fragments can link to docstrings of declared `composedref_modules` with `@composedref` links, resolved into real links at composition [#11](https://github.com/PumasAI/DocumenterFragments.jl/pull/11).
 
 ## [0.1.3](https://github.com/PumasAI/DocumenterFragments.jl/releases/tag/v0.1.3) - 2026-08-26
 

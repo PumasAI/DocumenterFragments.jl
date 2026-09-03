@@ -858,6 +858,7 @@ function is_module_or_ancestor(candidate, mod)
         parent === mod && return false
         mod = parent
     end
+    return
 end
 
 # Provision is checked on the loaded modules themselves, not on names, so

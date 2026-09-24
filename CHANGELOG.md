@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.2.2](https://github.com/PumasAI/DocumenterFragments.jl/releases/tag/v0.2.2) - 2026-09-24
+
+- Fragments can declare a `doctest_teardown` in `fragment.toml`, applied as Documenter's `DocTestTeardown` [#14](https://github.com/PumasAI/DocumenterFragments.jl/pull/14).
+
 ## [0.2.1](https://github.com/PumasAI/DocumenterFragments.jl/releases/tag/v0.2.1) - 2026-09-03
 
 - Fragments can link to docstrings of declared `composedref_modules` with `@composedref` links, resolved into real links at composition [#11](https://github.com/PumasAI/DocumenterFragments.jl/pull/11).

@@ -92,6 +92,19 @@ module FragmentDoctest
     function qux end
 end
 
+module FragmentTeardown
+    export tfun
+    """
+        tfun()
+
+    ```jldoctest
+    julia> ENV["FRAGMENT_TEARDOWN_STATE"]
+    "setup"
+    ```
+    """
+    function tfun end
+end
+
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 const MODULE_MAP = Dict(
     "FragmentA" => FragmentA,
@@ -104,14 +117,19 @@ const MODULE_MAP = Dict(
     "FragmentMissing" => FragmentMissing,
     "FragmentInternal" => FragmentInternal,
     "FragmentDoctest" => FragmentDoctest,
+    "FragmentTeardown" => FragmentTeardown,
     "FragmentCite" => FragmentCite,
 )
 VERSION >= v"1.11" && (MODULE_MAP["FragmentPublic"] = FragmentPublic)
 
 readbuilt(build, parts...) = read(joinpath(build, parts...), String)
 
-reset_doctestmeta!() =
-    foreach(m -> delete!(Documenter.DocMeta.getdocmeta(m), :DocTestSetup), values(MODULE_MAP))
+function reset_doctestmeta!()
+    for m in values(MODULE_MAP), key in (:DocTestSetup, :DocTestTeardown)
+        delete!(Documenter.DocMeta.getdocmeta(m), key)
+    end
+    return
+end
 
 function link_destinations(md, prefix)
     ast = convert(MarkdownAST.Node, Markdown.parse(md))
@@ -282,6 +300,16 @@ end
         module_map = MODULE_MAP,
     )
     @test isfile(joinpath(build, "docstrings", "index.html"))
+end
+
+@testset "doctest_teardown runs after the doctests" begin
+    reset_doctestmeta!()
+    build_fragment(
+        joinpath(FIXTURES, "fragment_teardown");
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+    @test get(ENV, "FRAGMENT_TEARDOWN_STATE", nothing) === nothing
 end
 
 @testset "integrate_fragments into a main site" begin

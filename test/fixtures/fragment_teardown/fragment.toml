@@ -1,0 +1,8 @@
+name = "Fragment Teardown"
+modules = ["FragmentTeardown"]
+doctest_setup = "ENV[\"FRAGMENT_TEARDOWN_STATE\"] = \"setup\""
+doctest_teardown = "delete!(ENV, \"FRAGMENT_TEARDOWN_STATE\")"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"

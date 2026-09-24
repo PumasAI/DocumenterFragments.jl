@@ -38,6 +38,7 @@ There is no `using MyPackage`; `build_fragment` loads the modules named in
 name = "Widgets"                          # section title in the main site and standalone sitename
 modules = ["Widgets", "WidgetsCore"]      # drives @autodocs coverage / checkdocs
 doctest_setup = "using Widgets, TestData" # applied via DocMeta.setdocmeta!
+doctest_teardown = "Widgets.reset!()"     # optional, runs after each doctest block
 bibliography = "references.bib"           # optional, relative to docs/
 composedref_modules = ["WidgetsBase"]         # optional, see "Linking to a dependency's docstrings"
 
@@ -55,6 +56,12 @@ title = "Functions"
 The metadata is the single source of truth: `build_fragment` reads it for the
 standalone build, and the main site build reads the same file to assemble its
 navigation, union the module lists, and replay each fragment's doctest setup.
+
+`doctest_teardown` becomes Documenter's `DocTestTeardown`, which runs after every
+doctest block of the fragment's modules, even a failing one. Use it to restore
+process-global state the setup changes (e.g. `ENV["COLUMNS"]`). Doctests run
+before `@example` blocks are expanded, so without a teardown such a change leaks
+into every `@example` block of the whole build.
 
 Placement in the larger site is deliberately absent: the mount path (e.g.
 `/widgets/`) and anchor namespace prefix are assigned by the main site at
@@ -449,5 +456,5 @@ an upstream gap and is not worked around here.
 just a changed value). The warning is kept on because its meaningful case is two
 fragments putting a different doctest setup on the same module, or a shared
 submodule via `recursive`. The cost is that a second build in the same process
-(an iterative rebuild) also warns; clear `DocTestSetup` between builds if that
-matters.
+(an iterative rebuild) also warns; clear `DocTestSetup` (and `DocTestTeardown`)
+between builds if that matters.

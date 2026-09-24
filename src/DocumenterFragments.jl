@@ -15,6 +15,7 @@ struct FragmentMeta
     modules::Vector{String}
     composedref_modules::Vector{String}
     doctest_setup::Union{Nothing, String}
+    doctest_teardown::Union{Nothing, String}
     bibliography::Union{Nothing, String}
     page_entries::Vector{Any}
     dir::String
@@ -26,10 +27,11 @@ function read_fragment(dir::AbstractString)
     modules = collect(String, get(toml, "modules", String[]))
     composedref_modules = collect(String, get(toml, "composedref_modules", String[]))
     setup = get(toml, "doctest_setup", nothing)
+    teardown = get(toml, "doctest_teardown", nothing)
     bib = get(toml, "bibliography", nothing)
     bibfile = bib === nothing ? nothing : joinpath(dir, bib)
     entries = collect(Any, get(toml, "pages", Any[]))
-    return FragmentMeta(name, modules, composedref_modules, setup, bibfile, entries, String(dir))
+    return FragmentMeta(name, modules, composedref_modules, setup, teardown, bibfile, entries, String(dir))
 end
 
 function slugify(s)
@@ -599,10 +601,16 @@ function set_currentmodule!(srcdir, scopename; page_meta = ())
 end
 
 function apply_doctestsetup!(meta::FragmentMeta, mods)
-    meta.doctest_setup === nothing && return
-    expr = Meta.parse(meta.doctest_setup)
+    set_doctestmeta!(mods, :DocTestSetup, meta.doctest_setup)
+    set_doctestmeta!(mods, :DocTestTeardown, meta.doctest_teardown)
+    return
+end
+
+function set_doctestmeta!(mods, key, code)
+    code === nothing && return
+    expr = Meta.parse(code)
     for m in mods
-        DocMeta.setdocmeta!(m, :DocTestSetup, expr; recursive = true)
+        DocMeta.setdocmeta!(m, key, expr; recursive = true)
     end
     return
 end
@@ -699,10 +707,11 @@ return the output directory.
 
 The fragment's `fragment.toml` supplies its name, the modules to document
 (loaded automatically, so `make.jl` needs no `using`), an optional
-`doctest_setup`, an optional `bibliography` file, and the page tree. Keyword
-arguments mirror the relevant `Documenter.makedocs`/`Documenter.HTML` options
-(`doctest`, `warnonly`, `checkdocs`, `prettyurls`, `plugins`, `page_meta`, ...);
-any extra keywords are forwarded to `makedocs`. Unlike `makedocs`, `checkdocs`
+`doctest_setup` and `doctest_teardown`, an optional `bibliography` file, and the
+page tree. Keyword arguments mirror the relevant
+`Documenter.makedocs`/`Documenter.HTML` options (`doctest`, `warnonly`,
+`checkdocs`, `prettyurls`, `plugins`, `page_meta`, ...); any extra keywords are
+forwarded to `makedocs`. Unlike `makedocs`, `checkdocs`
 defaults to `:public`, so unexported internal docstrings do not have to be
 spliced into any page.
 

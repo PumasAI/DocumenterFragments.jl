@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.3.0](https://github.com/PumasAI/DocumenterFragments.jl/releases/tag/v0.3.0) - 2026-11-18
+
 - Breaking: A fragment's `doctest_setup` and `doctest_teardown` now also apply to doctests on its pages, and pages, docstrings and `page_meta` may no longer set `DocTestSetup` or `DocTestTeardown` themselves [#15](https://github.com/PumasAI/DocumenterFragments.jl/pull/15).
 - Fragments can declare a `[doctest_env]` table in `fragment.toml`, setting environment variables for their doctests only [#15](https://github.com/PumasAI/DocumenterFragments.jl/pull/15).
 

@@ -37,10 +37,14 @@ There is no `using MyPackage`; `build_fragment` loads the modules named in
 ```toml
 name = "Widgets"                          # section title in the main site and standalone sitename
 modules = ["Widgets", "WidgetsCore"]      # drives @autodocs coverage / checkdocs
-doctest_setup = "using Widgets, TestData" # applied via DocMeta.setdocmeta!
+doctest_setup = "using Widgets, TestData" # runs before each doctest block
 doctest_teardown = "Widgets.reset!()"     # optional, runs after each doctest block
 bibliography = "references.bib"           # optional, relative to docs/
 composedref_modules = ["WidgetsBase"]         # optional, see "Linking to a dependency's docstrings"
+
+[doctest_env]                             # optional, set during each doctest block
+COLUMNS = "120"
+LINES = "30"
 
 [[pages]]
 title = "Introduction"
@@ -57,11 +61,23 @@ The metadata is the single source of truth: `build_fragment` reads it for the
 standalone build, and the main site build reads the same file to assemble its
 navigation, union the module lists, and replay each fragment's doctest setup.
 
+The doctest settings apply to every doctest block of the fragment, in its
+modules' docstrings (via `DocMeta.setdocmeta!`) and on its pages (via the
+injected `@meta` block). Pages and docstrings may therefore not set
+`DocTestSetup` or `DocTestTeardown` in their own `@meta` blocks, and neither may
+`page_meta`; all of these are errors.
+
 `doctest_teardown` becomes Documenter's `DocTestTeardown`, which runs after every
-doctest block of the fragment's modules, even a failing one. Use it to restore
+doctest block, even a failing one. Use it to restore
 process-global state the setup changes (e.g. `ENV["COLUMNS"]`). Doctests run
 before `@example` blocks are expanded, so without a teardown such a change leaks
 into every `@example` block of the whole build.
+
+For environment variables there is a dedicated `[doctest_env]` table. Its
+variables are set after `doctest_setup` and restored (or deleted, if they were
+unset) before `doctest_teardown`, for every doctest block. Fragments
+composed into one site can therefore use different values, e.g. a different
+`COLUMNS` for output width, without affecting each other or the main site.
 
 Placement in the larger site is deliberately absent: the mount path (e.g.
 `/widgets/`) and anchor namespace prefix are assigned by the main site at

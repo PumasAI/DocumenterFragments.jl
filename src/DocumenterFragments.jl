@@ -16,6 +16,7 @@ struct FragmentMeta
     composedref_modules::Vector{String}
     doctest_setup::Union{Nothing, String}
     doctest_teardown::Union{Nothing, String}
+    doctest_env::Dict{String, String}
     bibliography::Union{Nothing, String}
     page_entries::Vector{Any}
     dir::String
@@ -28,10 +29,19 @@ function read_fragment(dir::AbstractString)
     composedref_modules = collect(String, get(toml, "composedref_modules", String[]))
     setup = get(toml, "doctest_setup", nothing)
     teardown = get(toml, "doctest_teardown", nothing)
+    env = read_doctest_env(get(toml, "doctest_env", Dict{String, Any}()))
     bib = get(toml, "bibliography", nothing)
     bibfile = bib === nothing ? nothing : joinpath(dir, bib)
     entries = collect(Any, get(toml, "pages", Any[]))
-    return FragmentMeta(name, modules, composedref_modules, setup, teardown, bibfile, entries, String(dir))
+    return FragmentMeta(name, modules, composedref_modules, setup, teardown, env, bibfile, entries, String(dir))
+end
+
+function read_doctest_env(table)
+    table isa AbstractDict || error("`doctest_env` must be a table of environment variables.")
+    for (k, v) in table
+        v isa AbstractString || error("`doctest_env` value of \"$k\" must be a string, got $(repr(v)).")
+    end
+    return Dict{String, String}(table)
 end
 
 function slugify(s)
@@ -559,21 +569,35 @@ resolve_modules(meta::FragmentMeta, module_map) = load_modules(meta.modules, mod
 scope_identifier(key) =
     Symbol("DocumenterFragmentScope_" * replace(String(key), r"[^0-9A-Za-z_]" => "_"))
 
+const DOCTEST_KEYS = (
+    DocTestSetup = :documenterfragments_doctest_setup,
+    DocTestTeardown = :documenterfragments_doctest_teardown,
+)
+
 # Composedref modules are deliberately not made reachable from the scope: a plain
 # `@ref` must never resolve into them, so a fragment cannot pass standalone with a
 # ref that only the composed site could carry.
-function make_scope(mods, key)
+#
+# The scope also holds the fragment's doctest setup and teardown, so that the
+# `@meta` blocks of its pages, which are evaluated in `Main`, can refer to them.
+function make_scope(mods, key, doctest_meta)
     name = scope_identifier(key)
     scope = Module(name)
     for mod in mods
         Core.eval(scope, Expr(:using, Expr(:., fullname(mod)...)))
     end
+    for (metakey, expr) in pairs(doctest_meta)
+        Core.eval(scope, :(const $(DOCTEST_KEYS[metakey]) = $(QuoteNode(expr))))
+    end
     Core.eval(Main, :($name = $scope))
     return name
 end
 
-function meta_block(scopename; page_meta = ())
+function meta_block(scopename; page_meta = (), doctest_meta = (;))
     lines = ["CurrentModule = $(scopename)"]
+    for metakey in keys(doctest_meta)
+        push!(lines, "$metakey = $scopename.$(DOCTEST_KEYS[metakey])")
+    end
     for (k, v) in page_meta
         push!(lines, "$k = $v")
     end
@@ -592,24 +616,112 @@ function markdown_files(srcdir)
     return found
 end
 
-function set_currentmodule!(srcdir, scopename; page_meta = ())
-    block = meta_block(scopename; page_meta)
+function set_currentmodule!(srcdir, scopename; page_meta = (), doctest_meta = (;))
+    block = meta_block(scopename; page_meta, doctest_meta)
     for path in markdown_files(srcdir)
         prepend_block!(path, block)
     end
     return
 end
 
-function apply_doctestsetup!(meta::FragmentMeta, mods)
-    set_doctestmeta!(mods, :DocTestSetup, meta.doctest_setup)
-    set_doctestmeta!(mods, :DocTestTeardown, meta.doctest_teardown)
+is_meta_block(el) = el isa MarkdownAST.CodeBlock && startswith(el.info, "@meta")
+
+function meta_blocks!(codes, node)
+    is_meta_block(node.element) && push!(codes, node.element.code)
+    for c in node.children
+        meta_blocks!(codes, c)
+    end
+    return codes
+end
+
+meta_keys(body) = [
+    ex.args[1] for (ex, _) in Documenter.parseblock(body, nothing, nothing; raise = false)
+        if Documenter.isassign(ex)
+]
+
+doctest_meta_error(name, source, key) = error(
+    "Fragment \"$name\": $source sets `$key` in an `@meta` block. A fragment's doctest " *
+        "settings apply to all of its docstrings and pages alike; declare them as " *
+        "`doctest_setup`, `doctest_teardown` or `doctest_env` in fragment.toml instead.",
+)
+
+function check_doctest_meta(ast, name, source)
+    for code in meta_blocks!(String[], ast), key in meta_keys(code)
+        haskey(DOCTEST_KEYS, key) && doctest_meta_error(name, source, key)
+    end
     return
 end
 
-function set_doctestmeta!(mods, key, code)
-    code === nothing && return
-    expr = Meta.parse(code)
-    for m in mods
+function validate_doctest_meta(meta::FragmentMeta, mods, page_meta)
+    for path in markdown_files(joinpath(meta.dir, "src"))
+        source = "page \"$(relpath(path, meta.dir))\""
+        check_doctest_meta(markdown_ast(read(path, String)), meta.name, source)
+    end
+    for mod in mods, ast in module_docstring_asts!(MarkdownAST.Node[], mod)
+        check_doctest_meta(ast, meta.name, "a docstring of module \"$mod\"")
+    end
+    for (k, _) in page_meta
+        haskey(DOCTEST_KEYS, Symbol(k)) && doctest_meta_error(meta.name, "the `page_meta`", k)
+    end
+    return
+end
+
+const SAVED_ENV = Ref{Union{Nothing, Vector{Pair{String, Union{Nothing, String}}}}}(nothing)
+
+# Doctest blocks never nest, so anything still saved here comes from a block whose
+# teardown was skipped, and is restored before the next block saves its own.
+function apply_env!(env)
+    restore_env!()
+    SAVED_ENV[] = [k => get(ENV, k, nothing) for k in keys(env)]
+    for (k, v) in env
+        ENV[k] = v
+    end
+    return
+end
+
+function restore_env!()
+    saved = SAVED_ENV[]
+    saved === nothing && return
+    SAVED_ENV[] = nothing
+    for (k, v) in saved
+        v === nothing ? delete!(ENV, k) : (ENV[k] = v)
+    end
+    return
+end
+
+# Documenter skips a block's teardown when the block's own `setup` throws, so the
+# env of the last such block is restored once all doctests have run, before
+# `@example` blocks are evaluated.
+abstract type FragmentDoctestEnvRestore <: Documenter.Builder.DocumentPipeline end
+Documenter.Selectors.order(::Type{FragmentDoctestEnvRestore}) = 1.15
+Documenter.Selectors.runner(::Type{FragmentDoctestEnvRestore}, doc) = restore_env!()
+
+as_toplevel(ex) = Meta.isexpr(ex, :block) ? Expr(:toplevel, ex.args...) : ex
+
+function chain(exprs...)
+    present = [ex for ex in exprs if ex !== nothing]
+    isempty(present) && return nothing
+    return length(present) == 1 ? only(present) : Expr(:toplevel, map(as_toplevel, present)...)
+end
+
+parse_code(code) = code === nothing ? nothing : Meta.parse(code)
+
+# The env is applied after the user setup and restored before the user teardown,
+# because Documenter skips the remaining setup and the teardown when a setup
+# expression throws, and stops the teardown at the first expression that throws.
+#
+# Both keys are set as soon as either is needed, so that neither keeps a value from
+# an earlier build in the same session.
+function doctest_exprs(meta::FragmentMeta)
+    env = meta.doctest_env
+    setup = chain(parse_code(meta.doctest_setup), isempty(env) ? nothing : :($apply_env!($env)))
+    teardown = chain(isempty(env) ? nothing : :($restore_env!()), parse_code(meta.doctest_teardown))
+    setup === teardown === nothing && return (;)
+    return (DocTestSetup = something(setup, :nothing), DocTestTeardown = something(teardown, :nothing))
+end
+
+function apply_doctestsetup!(doctest_meta, mods)
+    for (key, expr) in pairs(doctest_meta), m in mods
         DocMeta.setdocmeta!(m, key, expr; recursive = true)
     end
     return
@@ -707,8 +819,8 @@ return the output directory.
 
 The fragment's `fragment.toml` supplies its name, the modules to document
 (loaded automatically, so `make.jl` needs no `using`), an optional
-`doctest_setup` and `doctest_teardown`, an optional `bibliography` file, and the
-page tree. Keyword arguments mirror the relevant
+`doctest_setup`, `doctest_teardown` and `doctest_env`, an optional
+`bibliography` file, and the page tree. Keyword arguments mirror the relevant
 `Documenter.makedocs`/`Documenter.HTML` options (`doctest`, `warnonly`,
 `checkdocs`, `prettyurls`, `plugins`, `page_meta`, ...); any extra keywords are
 forwarded to `makedocs`. Unlike `makedocs`, `checkdocs`
@@ -743,9 +855,11 @@ function build_fragment(
     meta = read_fragment(dir)
     meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
+    validate_doctest_meta(meta, mods, page_meta)
     composedref_mods = load_modules(meta.composedref_modules, module_map)
-    apply_doctestsetup!(meta, mods)
-    scopename = make_scope(mods, meta.name)
+    doctest_meta = doctest_exprs(meta)
+    apply_doctestsetup!(doctest_meta, mods)
+    scopename = make_scope(mods, meta.name, doctest_meta)
 
     staged = mktempdir()
     staged_src = joinpath(staged, "src")
@@ -766,7 +880,7 @@ function build_fragment(
     meta.bibliography === nothing || add_references_page!(pages, staged_src, meta.name)
     targets = composedref_targets(staged_src, mods, composedref_mods)
     isempty(targets) || add_composedrefs_page!(pages, staged_src, meta.name, targets)
-    set_currentmodule!(staged_src, scopename; page_meta)
+    set_currentmodule!(staged_src, scopename; page_meta, doctest_meta)
 
     # invokelatest: make_scope bound the scope module into Main during this call, so
     # makedocs must run in the latest world age to resolve `CurrentModule = $scopename`.
@@ -824,14 +938,16 @@ function prepare_fragment!(
     meta = read_fragment(dir)
     meta.bibliography === nothing || validate_bibliography_blocks(meta)
     mods = resolve_modules(meta, module_map)
+    validate_doctest_meta(meta, mods, page_meta)
     composedref_mods = load_modules(meta.composedref_modules, module_map)
-    apply_doctestsetup!(meta, mods)
-    scopename = make_scope(mods, slug)
+    doctest_meta = doctest_exprs(meta)
+    apply_doctestsetup!(doctest_meta, mods)
+    scopename = make_scope(mods, slug, doctest_meta)
 
     dest = joinpath(main_src, mount)
     copied = merge_fragment_src!(joinpath(dir, "src"), dest, mount, meta.name)
 
-    block = meta_block(scopename; page_meta)
+    block = meta_block(scopename; page_meta, doctest_meta)
     for rel in copied
         endswith(rel, ".md") || continue
         prepend_block!(joinpath(dest, rel), block)

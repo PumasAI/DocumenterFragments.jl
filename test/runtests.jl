@@ -105,6 +105,55 @@ module FragmentTeardown
     function tfun end
 end
 
+module EnvWide
+    export wide
+    """
+        wide()
+
+    ```jldoctest
+    julia> SETUP_RAN
+    true
+
+    julia> displaysize()
+    (30, 120)
+
+    julia> collect(1:60)'
+    1×60 adjoint(::Vector{Int64}) with eltype Int64:
+     1  2  3  4  5  6  7  8  9  10  11  12  13  14  15  16  17  …  47  48  49  50  51  52  53  54  55  56  57  58  59  60
+    ```
+    """
+    function wide end
+end
+
+module EnvNarrow
+    export narrow
+    """
+        narrow()
+
+    ```jldoctest
+    julia> ENV["COLUMNS"]
+    "90"
+
+    julia> collect(1:60)'
+    1×60 adjoint(::Vector{Int64}) with eltype Int64:
+     1  2  3  4  5  6  7  8  9  10  11  12  13  …  51  52  53  54  55  56  57  58  59  60
+    ```
+    """
+    function narrow end
+end
+
+module EnvDocMeta
+    export docmeta
+    """
+        docmeta()
+
+    ```@meta
+    DocTestSetup = nothing
+    ```
+    """
+    function docmeta end
+end
+
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 const MODULE_MAP = Dict(
     "FragmentA" => FragmentA,
@@ -118,6 +167,8 @@ const MODULE_MAP = Dict(
     "FragmentInternal" => FragmentInternal,
     "FragmentDoctest" => FragmentDoctest,
     "FragmentTeardown" => FragmentTeardown,
+    "EnvWide" => EnvWide,
+    "EnvNarrow" => EnvNarrow,
     "FragmentCite" => FragmentCite,
 )
 VERSION >= v"1.11" && (MODULE_MAP["FragmentPublic"] = FragmentPublic)
@@ -310,6 +361,151 @@ end
         module_map = MODULE_MAP,
     )
     @test get(ENV, "FRAGMENT_TEARDOWN_STATE", nothing) === nothing
+end
+
+@testset "doctest_env applies per fragment and is restored" begin
+    reset_doctestmeta!()
+    main_src = joinpath(mktempdir(), "src")
+    cp(joinpath(FIXTURES, "env_host", "src"), main_src)
+
+    c = integrate_fragments(
+        main_src,
+        [
+            (; dir = joinpath(FIXTURES, "env_wide"), mount = "wide"),
+            (; dir = joinpath(FIXTURES, "env_narrow"), mount = "narrow"),
+        ];
+        module_map = MODULE_MAP,
+    )
+
+    build = mktempdir()
+    withenv("COLUMNS" => "100", "LINES" => nothing) do
+        Base.invokelatest(
+            Documenter.makedocs;
+            sitename = "Host",
+            modules = c.modules,
+            source = main_src,
+            build,
+            doctest = true,
+            warnonly = Symbol[],
+            remotes = nothing,
+            plugins = c.plugins,
+            format = Documenter.HTML(; prettyurls = true, edit_link = nothing, repolink = nothing, inventory_version = ""),
+            pages = Any["Home" => "index.md"; [f.pages for f in c.fragments]],
+        )
+        @test ENV["COLUMNS"] == "100"
+        @test !haskey(ENV, "LINES")
+    end
+    @test occursin("host COLUMNS=100 LINES=unset", readbuilt(build, "index.html"))
+end
+
+@testset "fragment pages may not set their own doctest setup" begin
+    fragment = joinpath(mktempdir(), "env_narrow")
+    cp(joinpath(FIXTURES, "env_narrow"), fragment)
+    page = joinpath(fragment, "src", "examples.md")
+    write(page, "```@meta\nDocTestSetup = :(using EnvNarrow)\n```\n\n" * read(page, String))
+    @test_throws "\"src/examples.md\" sets `DocTestSetup` in an `@meta` block" build_fragment(
+        fragment;
+        build = mktempdir(),
+        module_map = MODULE_MAP,
+    )
+
+    write(page, "````markdown\n```@meta\nDocTestSetup = nothing\n```\n````\n")
+    meta = DocumenterFragments.read_fragment(fragment)
+    @test DocumenterFragments.validate_doctest_meta(meta, [EnvNarrow], ()) === nothing
+
+    @test_throws "sets `DocTestTeardown` in an `@meta` block" integrate_fragments(
+        joinpath(mktempdir(), "src"),
+        [(; dir = joinpath(FIXTURES, "env_narrow"), mount = "narrow", page_meta = ("DocTestTeardown" => "nothing",))];
+        module_map = MODULE_MAP,
+    )
+end
+
+@testset "docstrings may not set their own doctest setup" begin
+    fragment = mktempdir()
+    mkpath(joinpath(fragment, "src"))
+    write(joinpath(fragment, "src", "api.md"), "# API\n")
+    write(joinpath(fragment, "fragment.toml"), "name = \"Doc Meta\"\nmodules = [\"EnvDocMeta\"]\n")
+    @test_throws ["docstring of module", "EnvDocMeta", "sets `DocTestSetup` in an `@meta` block"] build_fragment(
+        fragment;
+        build = mktempdir(),
+        module_map = Dict("EnvDocMeta" => EnvDocMeta),
+    )
+end
+
+@testset "doctest_env is restored when a block's own setup throws" begin
+    reset_doctestmeta!()
+    fragment = joinpath(mktempdir(), "env_narrow")
+    cp(joinpath(FIXTURES, "env_narrow"), fragment)
+    page = joinpath(fragment, "src", "examples.md")
+    write(
+        page, read(page, String) * """
+
+            ```jldoctest; setup = :(error("boom"))
+            julia> 1
+            1
+            ```
+
+            ```@example
+            println("page COLUMNS=", ENV["COLUMNS"])
+            ```
+            """,
+    )
+    build = mktempdir()
+    withenv("COLUMNS" => "100") do
+        silent_build(fragment; build, warnonly = [:doctest], module_map = Dict("EnvNarrow" => EnvNarrow))
+        @test ENV["COLUMNS"] == "100"
+    end
+    @test occursin("page COLUMNS=100", readbuilt(build, "examples", "index.html"))
+end
+
+@testset "rebuilding after doctest_env is removed" begin
+    reset_doctestmeta!()
+    withenv("COLUMNS" => "120", "LINES" => "30") do
+        build_fragment(joinpath(FIXTURES, "env_wide"); build = mktempdir(), module_map = MODULE_MAP)
+
+        fragment = joinpath(mktempdir(), "env_wide")
+        cp(joinpath(FIXTURES, "env_wide"), fragment)
+        toml = joinpath(fragment, "fragment.toml")
+        write(toml, replace(read(toml, String), "[doctest_env]\nCOLUMNS = \"120\"\nLINES = \"30\"\n" => ""))
+        build_fragment(fragment; build = mktempdir(), module_map = MODULE_MAP)
+        @test ENV["COLUMNS"] == "120"
+    end
+end
+
+@testset "doctest_env must be a table of strings" begin
+    dir = mktempdir()
+    write(joinpath(dir, "fragment.toml"), "name = \"X\"\ndoctest_env = \"COLUMNS=120\"\n")
+    @test_throws "`doctest_env` must be a table" DocumenterFragments.read_fragment(dir)
+    write(joinpath(dir, "fragment.toml"), "name = \"X\"\n\n[doctest_env]\nCOLUMNS = 120\n")
+    @test_throws "`doctest_env` value of \"COLUMNS\" must be a string" DocumenterFragments.read_fragment(dir)
+end
+
+@testset "doctest_env in a standalone build" begin
+    reset_doctestmeta!()
+    withenv("COLUMNS" => "100") do
+        build_fragment(
+            joinpath(FIXTURES, "env_narrow");
+            build = mktempdir(),
+            module_map = Dict("EnvNarrow" => EnvNarrow),
+        )
+        @test ENV["COLUMNS"] == "100"
+    end
+
+    reset_doctestmeta!()
+    fragment = joinpath(mktempdir(), "env_narrow")
+    cp(joinpath(FIXTURES, "env_narrow"), fragment)
+    write(
+        joinpath(fragment, "fragment.toml"),
+        replace(read(joinpath(fragment, "fragment.toml"), String), "\"90\"" => "\"120\""),
+    )
+    withenv("COLUMNS" => "100") do
+        @test_throws "doctest error" silent_build(
+            fragment;
+            build = mktempdir(),
+            module_map = Dict("EnvNarrow" => EnvNarrow),
+        )
+        @test ENV["COLUMNS"] == "100"
+    end
 end
 
 @testset "integrate_fragments into a main site" begin

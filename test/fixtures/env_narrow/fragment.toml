@@ -1,0 +1,13 @@
+name = "Env Narrow"
+modules = ["EnvNarrow"]
+
+[doctest_env]
+COLUMNS = "90"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"
+
+[[pages]]
+title = "Examples"
+file = "examples.md"

@@ -1,0 +1,15 @@
+name = "Env Wide"
+modules = ["EnvWide"]
+doctest_setup = "const SETUP_RAN = true"
+
+[doctest_env]
+COLUMNS = "120"
+LINES = "30"
+
+[[pages]]
+title = "API"
+file = "docstrings.md"
+
+[[pages]]
+title = "Examples"
+file = "examples.md"
